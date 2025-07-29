@@ -1,0 +1,633 @@
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  labels:
+    kueue.x-k8s.io/queue-name: lq
+  name: sft
+spec:
+  nprocPerNode: '1'
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: 'false'
+        spec:
+          terminationGracePeriodSeconds: 120
+          containers:
+            - args:
+                - |-
+
+                  program_path=$(mktemp -d)
+                  read -r -d '' SCRIPT << EOM
+
+                  def main(parameters):
+                      import random
+                      import os
+                      import torch
+                      from datetime import datetime
+
+                      from datasets import load_dataset
+                      from transformers import (
+                          AutoTokenizer,
+                          TrainingArguments,
+                          TrainerState,
+                          TrainerControl,
+                          TrainerCallback,
+                          set_seed,
+                      )
+
+                      from trl import (
+                          ModelConfig,
+                          ScriptArguments,
+                          SFTConfig,
+                          SFTTrainer,
+                          TrlParser,
+                          get_peft_config,
+                          get_quantization_config,
+                          get_kbit_device_map,
+                      )
+
+                      class CheckpointOnDemandCallback(TrainerCallback):
+                          """
+                          A custom callback to save a checkpoint when a specific sentinel file
+                          is detected, and create a completion sentinel file after saving.
+                          """
+                          def __init__(self, output_dir: str, request_file: str, completion_file: str):
+                              self.output_dir = output_dir
+                              self.request_file = request_file
+                              self.completion_file = completion_file
+                              self.checkpoint_requested = False
+                              self.save_triggered = False
+                              self.checkpoint_stream = None
+
+                          def _log_message(self, message: str):
+                              """Helper to print messages with a timestamp."""
+                              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                              print(f"[{timestamp}] {message}")
+
+                          def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if torch.cuda.is_available():
+                                  self.checkpoint_stream = torch.cuda.Stream()
+                                  self._log_message("Created dedicated CUDA stream for checkpointing.")
+
+                              # Ensure the output directory exists for sentinel files
+                              os.makedirs(self.output_dir, exist_ok=True)
+                              # Clean up any stale request file from a previous run
+                              if os.path.exists(self.request_file):
+                                  os.remove(self.request_file)
+                                  self._log_message(f"Removed stale request file: {self.request_file}")
+                              # Clean up any stale completion file from a previous run
+                              if os.path.exists(self.completion_file):
+                                  os.remove(self.completion_file)
+                                  self._log_message(f"Removed stale completion file: {self.completion_file}")
+
+
+                          def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              # Check for the request file at each step
+                              if not self.checkpoint_requested and os.path.exists(self.request_file):
+                                  self._log_message(f"Checkpoint request file detected: {self.request_file}")
+                                  self.checkpoint_requested = True
+
+                                  # Remove the request file to acknowledge it
+                                  try:
+                                      os.remove(self.request_file)
+                                      self._log_message(f"Removed checkpoint request file: {self.request_file}")
+                                  except OSError as e:
+                                      self._log_message(f"Error removing request file {self.request_file}: {e}")
+
+                                  if not self.save_triggered:
+                                      if self.checkpoint_stream:
+                                          # Ensure all computations on the default stream are complete
+                                          torch.cuda.current_stream().synchronize()
+                                          with torch.cuda.stream(self.checkpoint_stream):
+                                              self._log_message(f"Synchronizing and saving checkpoint at step {state.global_step}...")
+                                              control.should_save = True
+                                              control.should_training_stop = True # Signal Trainer to stop after save
+                                              self.save_triggered = True
+                                      else:
+                                          self._log_message(f"Saving checkpoint at step {state.global_step}...")
+                                          control.should_save = True
+                                          control.should_training_stop = True # Signal Trainer to stop after save
+                                          self.save_triggered = True
+
+                          def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if self.checkpoint_requested:
+                                  self._log_message(f"Training ended due to checkpoint request. Final checkpoint should have been saved.")
+
+                          def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              self._log_message(f"Save finished.")
+                              if self.checkpoint_requested: # Only create completion file if a request was made
+                                  try:
+                                      # Create the completion sentinel file
+                                      rank = os.environ.get('RANK', '0')
+                                      with open(self.completion_file, "w") as f:
+                                          f.write(f"checkpoint saved by rank {rank}\n")
+                                      self._log_message(f"Completion sentinel file created: {self.completion_file}")
+                                  except Exception as e:
+                                      self._log_message(f"Error creating completion sentinel file: {e}")
+
+
+                      parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
+                      script_args, training_args, model_args = parser.parse_dict(parameters)
+
+                      # Set seed for reproducibility
+                      set_seed(training_args.seed)
+
+                      # Model and tokenizer
+                      quantization_config = get_quantization_config(model_args)
+                      model_kwargs = dict(
+                          revision=model_args.model_revision,
+                          trust_remote_code=model_args.trust_remote_code,
+                          attn_implementation=model_args.attn_implementation,
+                          torch_dtype=model_args.torch_dtype,
+                          use_cache=False if training_args.gradient_checkpointing or
+                                             training_args.fsdp_config.get("activation_checkpointing",
+                                                                           False) else True,
+                          device_map=get_kbit_device_map() if quantization_config is not None else None,
+                          quantization_config=quantization_config,
+                      )
+                      training_args.model_init_kwargs = model_kwargs
+                      tokenizer = AutoTokenizer.from_pretrained(
+                          model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
+                      )
+                      if tokenizer.pad_token is None:
+                          # Models like Llama 3 use a dedicated padding token
+                          right_pad_id = tokenizer.convert_tokens_to_ids('<|finetune_right_pad_id|>')
+                          if right_pad_id is not None:
+                              tokenizer.pad_token = '<|finetune_right_pad_id|>'
+                          else:
+                              tokenizer.pad_token = tokenizer.eos_token
+
+                      # Chat template
+                      # You may need to provide your own chat template if the model does not have a default one
+                      # or if you want to customize it
+                      # Llama 3 instruct template, make sure to add "lm_head" and "embed_tokens" layers to lora_modules_to_save
+                      # LLAMA_3_CHAT_TEMPLATE="{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+                      # Anthropic/Vicuna like template without the need for special tokens
+                      # LLAMA_3_CHAT_TEMPLATE = (
+                      #     "{% for message in messages %}"
+                      #     "{% if message['role'] == 'system' %}"
+                      #     "{{ message['content'] }}"
+                      #     "{% elif message['role'] == 'user' %}"
+                      #     "{{ '\n\nHuman: ' + message['content'] +  eos_token }}"
+                      #     "{% elif message['role'] == 'assistant' %}"
+                      #     "{{ '\n\nAssistant: '  + message['content'] +  eos_token  }}"
+                      #     "{% endif %}"
+                      #     "{% endfor %}"
+                      #     "{% if add_generation_prompt %}"
+                      #     "{{ '\n\nAssistant: ' }}"
+                      #     "{% endif %}"
+                      # )
+                      # tokenizer.chat_template = LLAMA_3_CHAT_TEMPLATE
+
+                      # Datasets
+                      train_dataset = load_dataset(
+                          path=script_args.dataset_name,
+                          name=script_args.dataset_config,
+                          split=script_args.dataset_train_split,
+                      )
+                      test_dataset = None
+                      if training_args.eval_strategy != "no":
+                          test_dataset = load_dataset(
+                              path=script_args.dataset_name,
+                              name=script_args.dataset_config,
+                              split=script_args.dataset_test_split,
+                          )
+
+                      # Templatize datasets
+                      # You may need to adjust the mapping between columns and the chat template
+                      def template_dataset(sample):
+                          # return {"text": tokenizer.apply_chat_template(examples["messages"], tokenize=False)}
+                          messages = [
+                              {"role": "user", "content": sample['question']},
+                              {"role": "assistant", "content": sample['answer']},
+                          ]
+                          return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
+
+                      train_dataset = train_dataset.map(template_dataset, remove_columns=["question", "answer"])
+                      if training_args.eval_strategy != "no":
+                          # test_dataset = test_dataset.map(template_dataset, remove_columns=["messages"])
+                          test_dataset = test_dataset.map(template_dataset, remove_columns=["question", "answer"])
+
+                      # Check random samples
+                      with training_args.main_process_first(
+                          desc="Log few samples from the training set"
+                      ):
+                          for index in random.sample(range(len(train_dataset)), 2):
+                              print(train_dataset[index]["text"])
+
+                      # Training
+                      trainer = SFTTrainer(
+                          model=model_args.model_name_or_path,
+                          args=training_args,
+                          train_dataset=train_dataset,
+                          eval_dataset=test_dataset,
+                          peft_config=get_peft_config(model_args),
+                          processing_class=tokenizer,
+                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request_rank_{os.environ.get('RANK', '0')}"), os.path.join(training_args.output_dir, f".checkpoint_completed_rank_{os.environ.get('RANK', '0')}" ))],
+                      )
+
+                      if trainer.accelerator.is_main_process and hasattr(trainer.model, "print_trainable_parameters"):
+                          trainer.model.print_trainable_parameters()
+
+                      checkpoint = None
+                      if training_args.resume_from_checkpoint is not None:
+                          checkpoint = training_args.resume_from_checkpoint
+
+                      trainer.train(resume_from_checkpoint=checkpoint)
+
+                      trainer.save_model(training_args.output_dir)
+
+                      with training_args.main_process_first(desc="Training completed"):
+                          print(f"Training completed, model checkpoint written to {training_args.output_dir}")
+
+                  main({'model_name_or_path': 'meta-llama/Llama-3.1-8B-Instruct', 'model_revision': 'main', 'torch_dtype': 'bfloat16', 'attn_implementation': 'flash_attention_2', 'use_liger': False, 'use_peft': True, 'lora_r': 16, 'lora_alpha': 8, 'lora_dropout': 0.05, 'lora_target_modules': ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], 'lora_modules_to_save': [], 'load_in_4bit': False, 'load_in_8bit': False, 'dataset_name': 'gsm8k', 'dataset_config': 'main', 'dataset_train_split': 'train', 'dataset_test_split': 'test', 'dataset_text_field': 'text', 'dataset_kwargs': {'add_special_tokens': False, 'append_concat_token': False}, 'max_seq_length': 1024, 'dataset_batch_size': 1000, 'packing': False, 'num_train_epochs': 1, 'per_device_train_batch_size': 32, 'per_device_eval_batch_size': 32, 'auto_find_batch_size': False, 'eval_strategy': 'epoch', 'bf16': True, 'tf32': False, 'learning_rate': 0.0002, 'warmup_steps': 10, 'lr_scheduler_type': 'inverse_sqrt', 'optim': 'adamw_torch_fused', 'max_grad_norm': 1.0, 'seed': 42, 'gradient_accumulation_steps': 1, 'gradient_checkpointing': False, 'gradient_checkpointing_kwargs': {'use_reentrant': False}, 'fsdp': 'full_shard auto_wrap', 'fsdp_config': {'activation_checkpointing': True, 'cpu_ram_efficient_loading': False, 'sync_module_states': True, 'use_orig_params': True, 'limit_all_gathers': False}, 'save_strategy': 'steps', 'save_total_limit': 1, 'resume_from_checkpoint': False, 'save_steps': 10, 'log_level': 'debug', 'logging_strategy': 'steps', 'logging_steps': 1, 'report_to': ['tensorboard'], 'output_dir': '/mnt/shared/Meta-Llama-3.1-8B-Instruct'})
+
+                  EOM
+                  printf "%s" "$SCRIPT" > "$program_path/ephemeral_script.py"
+                  torchrun "$program_path/ephemeral_script.py"
+              command:
+                - bash
+                - '-c'
+              env:
+                - name: HF_HOME
+                  value: /mnt/shared/.cache
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      key: HF_TOKEN
+                      name: hf-token
+                - name: NCCL_DEBUG
+                  value: INFO
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        OUTPUT_DIR="/mnt/shared/Meta-Llama-3.1-8B-Instruct" # Must match Python script's output_dir
+                        POD_RANK="${RANK:-0}" # Get rank from env, default to 0
+                        # Define the new request and completion sentinel file paths
+                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request_rank_${POD_RANK}"
+                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed_rank_${POD_RANK}"
+                        TIMEOUT_SECONDS=300 # Max 5 minutes to wait
+                        WAIT_INTERVAL_SECONDS=5 # Check every 5 seconds
+
+                        echo "$(date) PreStop hook: Creating checkpoint request file: ${REQUEST_SENTINEL_FILE}"
+                        touch "${REQUEST_SENTINEL_FILE}" # Create the request sentinel file
+
+                        echo "$(date) PreStop hook: Waiting for checkpoint completion file: ${COMPLETION_SENTINEL_FILE}"
+                        start_time=$(date +%s)
+                        while true; do
+                          if [ -f "${COMPLETION_SENTINEL_FILE}" ]; then
+                            echo "$(date) PreStop hook: Checkpoint completion file found: ${COMPLETION_SENTINEL_FILE}. Checkpoint save confirmed."
+                            rm -f "${COMPLETION_SENTINEL_FILE}" # Clean up
+                            break
+                          fi
+
+                          current_time=$(date +%s)
+                          elapsed_time=$((current_time - start_time))
+
+                          if [ "${elapsed_time}" -ge "${TIMEOUT_SECONDS}" ]; then
+                            echo "$(date) PreStop hook: Timeout (${TIMEOUT_SECONDS}s) reached while waiting for checkpoint completion. Exiting preStop hook with non-zero status to indicate potential issue."
+                            exit 1 # Indicate failure
+                          fi
+
+                          echo "$(date) PreStop hook: Still waiting for checkpoint completion... (${elapsed_time}/${TIMEOUT_SECONDS}s elapsed)"
+                          sleep "${WAIT_INTERVAL_SECONDS}"
+                        done
+                        echo "$(date) PreStop hook finished successfully."
+              image: 'quay.io/modh/training:py311-cuda124-torch251'
+              name: pytorch
+              resources:
+                limits:
+                  cpu: '4'
+                  memory: 64Gi
+                  nvidia.com/gpu: '1'
+                requests:
+                  cpu: '4'
+                  memory: 64Gi
+                  nvidia.com/gpu: '1'
+              volumeMounts:
+                - mountPath: /mnt/shared
+                  name: shared
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: shared
+    Worker:
+      replicas: 1
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: 'false'
+        spec:
+          terminationGracePeriodSeconds: 120
+          containers:
+            - args:
+                - |-
+
+                  program_path=$(mktemp -d)
+                  read -r -d '' SCRIPT << EOM
+
+                  def main(parameters):
+                      import random
+                      import os
+                      import torch
+                      from datetime import datetime
+
+                      from datasets import load_dataset
+                      from transformers import (
+                          AutoTokenizer,
+                          TrainingArguments,
+                          TrainerState,
+                          TrainerControl,
+                          TrainerCallback,
+                          set_seed,
+                      )
+
+                      from trl import (
+                          ModelConfig,
+                          ScriptArguments,
+                          SFTConfig,
+                          SFTTrainer,
+                          TrlParser,
+                          get_peft_config,
+                          get_quantization_config,
+                          get_kbit_device_map,
+                      )
+
+                      class CheckpointOnDemandCallback(TrainerCallback):
+                          """
+                          A custom callback to save a checkpoint when a specific sentinel file
+                          is detected, and create a completion sentinel file after saving.
+                          """
+                          def __init__(self, output_dir: str, request_file: str, completion_file: str):
+                              self.output_dir = output_dir
+                              self.request_file = request_file
+                              self.completion_file = completion_file
+                              self.checkpoint_requested = False
+                              self.save_triggered = False
+                              self.checkpoint_stream = None
+
+                          def _log_message(self, message: str):
+                              """Helper to print messages with a timestamp."""
+                              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                              print(f"[{timestamp}] {message}")
+
+                          def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if torch.cuda.is_available():
+                                  self.checkpoint_stream = torch.cuda.Stream()
+                                  self._log_message("Created dedicated CUDA stream for checkpointing.")
+
+                              # Ensure the output directory exists for sentinel files
+                              os.makedirs(self.output_dir, exist_ok=True)
+                              # Clean up any stale request file from a previous run
+                              if os.path.exists(self.request_file):
+                                  os.remove(self.request_file)
+                                  self._log_message(f"Removed stale request file: {self.request_file}")
+                              # Clean up any stale completion file from a previous run
+                              if os.path.exists(self.completion_file):
+                                  os.remove(self.completion_file)
+                                  self._log_message(f"Removed stale completion file: {self.completion_file}")
+
+
+                          def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              # Check for the request file at each step
+                              if not self.checkpoint_requested and os.path.exists(self.request_file):
+                                  self._log_message(f"Checkpoint request file detected: {self.request_file}")
+                                  self.checkpoint_requested = True
+
+                                  # Remove the request file to acknowledge it
+                                  try:
+                                      os.remove(self.request_file)
+                                      self._log_message(f"Removed checkpoint request file: {self.request_file}")
+                                  except OSError as e:
+                                      self._log_message(f"Error removing request file {self.request_file}: {e}")
+
+                                  if not self.save_triggered:
+                                      if self.checkpoint_stream:
+                                          # Ensure all computations on the default stream are complete
+                                          torch.cuda.current_stream().synchronize()
+                                          with torch.cuda.stream(self.checkpoint_stream):
+                                              self._log_message(f"Synchronizing and saving checkpoint at step {state.global_step}...")
+                                              control.should_save = True
+                                              control.should_training_stop = True # Signal Trainer to stop after save
+                                              self.save_triggered = True
+                                      else:
+                                          self._log_message(f"Saving checkpoint at step {state.global_step}...")
+                                          control.should_save = True
+                                          control.should_training_stop = True # Signal Trainer to stop after save
+                                          self.save_triggered = True
+
+                          def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if self.checkpoint_requested:
+                                  self._log_message(f"Training ended due to checkpoint request. Final checkpoint should have been saved.")
+
+                          def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              self._log_message(f"Save finished.")
+                              if self.checkpoint_requested: # Only create completion file if a request was made
+                                  try:
+                                      # Create the completion sentinel file
+                                      rank = os.environ.get('RANK', '0')
+                                      with open(self.completion_file, "w") as f:
+                                          f.write(f"checkpoint saved by rank {rank}\n")
+                                      self._log_message(f"Completion sentinel file created: {self.completion_file}")
+                                  except Exception as e:
+                                      self._log_message(f"Error creating completion sentinel file: {e}")
+
+
+                      parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
+                      script_args, training_args, model_args = parser.parse_dict(parameters)
+
+                      # Set seed for reproducibility
+                      set_seed(training_args.seed)
+
+                      # Model and tokenizer
+                      quantization_config = get_quantization_config(model_args)
+                      model_kwargs = dict(
+                          revision=model_args.model_revision,
+                          trust_remote_code=model_args.trust_remote_code,
+                          attn_implementation=model_args.attn_implementation,
+                          torch_dtype=model_args.torch_dtype,
+                          use_cache=False if training_args.gradient_checkpointing or
+                                             training_args.fsdp_config.get("activation_checkpointing",
+                                                                           False) else True,
+                          device_map=get_kbit_device_map() if quantization_config is not None else None,
+                          quantization_config=quantization_config,
+                      )
+                      training_args.model_init_kwargs = model_kwargs
+                      tokenizer = AutoTokenizer.from_pretrained(
+                          model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, use_fast=True
+                      )
+                      if tokenizer.pad_token is None:
+                          # Models like Llama 3 use a dedicated padding token
+                          right_pad_id = tokenizer.convert_tokens_to_ids('<|finetune_right_pad_id|>')
+                          if right_pad_id is not None:
+                              tokenizer.pad_token = '<|finetune_right_pad_id|>'
+                          else:
+                              tokenizer.pad_token = tokenizer.eos_token
+
+                      # Chat template
+                      # You may need to provide your own chat template if the model does not have a default one
+                      # or if you want to customize it
+                      # Llama 3 instruct template, make sure to add "lm_head" and "embed_tokens" layers to lora_modules_to_save
+                      # LLAMA_3_CHAT_TEMPLATE="{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+                      # Anthropic/Vicuna like template without the need for special tokens
+                      # LLAMA_3_CHAT_TEMPLATE = (
+                      #     "{% for message in messages %}"
+                      #     "{% if message['role'] == 'system' %}"
+                      #     "{{ message['content'] }}"
+                      #     "{% elif message['role'] == 'user' %}"
+                      #     "{{ '\n\nHuman: ' + message['content'] +  eos_token }}"
+                      #     "{% elif message['role'] == 'assistant' %}"
+                      #     "{{ '\n\nAssistant: '  + message['content'] +  eos_token  }}"
+                      #     "{% endif %}"
+                      #     "{% endfor %}"
+                      #     "{% if add_generation_prompt %}"
+                      #     "{{ '\n\nAssistant: ' }}"
+                      #     "{% endif %}"
+                      # )
+                      # tokenizer.chat_template = LLAMA_3_CHAT_TEMPLATE
+
+                      # Datasets
+                      train_dataset = load_dataset(
+                          path=script_args.dataset_name,
+                          name=script_args.dataset_config,
+                          split=script_args.dataset_train_split,
+                      )
+                      test_dataset = None
+                      if training_args.eval_strategy != "no":
+                          test_dataset = load_dataset(
+                              path=script_args.dataset_name,
+                              name=script_args.dataset_config,
+                              split=script_args.dataset_test_split,
+                          )
+
+                      # Templatize datasets
+                      # You may need to adjust the mapping between columns and the chat template
+                      def template_dataset(sample):
+                          # return {"text": tokenizer.apply_chat_template(examples["messages"], tokenize=False)}
+                          messages = [
+                              {"role": "user", "content": sample['question']},
+                              {"role": "assistant", "content": sample['answer']},
+                          ]
+                          return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
+
+                      train_dataset = train_dataset.map(template_dataset, remove_columns=["question", "answer"])
+                      if training_args.eval_strategy != "no":
+                          # test_dataset = test_dataset.map(template_dataset, remove_columns=["messages"])
+                          test_dataset = test_dataset.map(template_dataset, remove_columns=["question", "answer"])
+
+                      # Check random samples
+                      with training_args.main_process_first(
+                          desc="Log few samples from the training set"
+                      ):
+                          for index in random.sample(range(len(train_dataset)), 2):
+                              print(train_dataset[index]["text"])
+
+                      # Training
+                      trainer = SFTTrainer(
+                          model=model_args.model_name_or_path,
+                          args=training_args,
+                          train_dataset=train_dataset,
+                          eval_dataset=test_dataset,
+                          peft_config=get_peft_config(model_args),
+                          processing_class=tokenizer,
+                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request_rank_{os.environ.get('RANK', '0')}"), os.path.join(training_args.output_dir, f".checkpoint_completed_rank_{os.environ.get('RANK', '0')}" ))],
+                      )
+
+                      if trainer.accelerator.is_main_process and hasattr(trainer.model, "print_trainable_parameters"):
+                          trainer.model.print_trainable_parameters()
+
+                      checkpoint = None
+                      if training_args.resume_from_checkpoint is not None:
+                          checkpoint = training_args.resume_from_checkpoint
+
+                      trainer.train(resume_from_checkpoint=checkpoint)
+
+                      trainer.save_model(training_args.output_dir)
+
+                      with training_args.main_process_first(desc="Training completed"):
+                          print(f"Training completed, model checkpoint written to {training_args.output_dir}")
+
+                  main({'model_name_or_path': 'meta-llama/Llama-3.1-8B-Instruct', 'model_revision': 'main', 'torch_dtype': 'bfloat16', 'attn_implementation': 'flash_attention_2', 'use_liger': False, 'use_peft': True, 'lora_r': 16, 'lora_alpha': 8, 'lora_dropout': 0.05, 'lora_target_modules': ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], 'lora_modules_to_save': [], 'load_in_4bit': False, 'load_in_8bit': False, 'dataset_name': 'gsm8k', 'dataset_config': 'main', 'dataset_train_split': 'train', 'dataset_test_split': 'test', 'dataset_text_field': 'text', 'dataset_kwargs': {'add_special_tokens': False, 'append_concat_token': False}, 'max_seq_length': 1024, 'dataset_batch_size': 1000, 'packing': False, 'num_train_epochs': 1, 'per_device_train_batch_size': 32, 'per_device_eval_batch_size': 32, 'auto_find_batch_size': False, 'eval_strategy': 'epoch', 'bf16': True, 'tf32': False, 'learning_rate': 0.0002, 'warmup_steps': 10, 'lr_scheduler_type': 'inverse_sqrt', 'optim': 'adamw_torch_fused', 'max_grad_norm': 1.0, 'seed': 42, 'gradient_accumulation_steps': 1, 'gradient_checkpointing': False, 'gradient_checkpointing_kwargs': {'use_reentrant': False}, 'fsdp': 'full_shard auto_wrap', 'fsdp_config': {'activation_checkpointing': True, 'cpu_ram_efficient_loading': False, 'sync_module_states': True, 'use_orig_params': True, 'limit_all_gathers': False}, 'save_strategy': 'steps', 'save_total_limit': 1, 'resume_from_checkpoint': False, 'save_steps': 10, 'log_level': 'debug', 'logging_strategy': 'steps', 'logging_steps': 1, 'report_to': ['tensorboard'], 'output_dir': '/mnt/shared/Meta-Llama-3.1-8B-Instruct'})
+
+                  EOM
+                  printf "%s" "$SCRIPT" > "$program_path/ephemeral_script.py"
+                  torchrun "$program_path/ephemeral_script.py"
+              command:
+                - bash
+                - '-c'
+              env:
+                - name: HF_HOME
+                  value: /mnt/shared/.cache
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      key: HF_TOKEN
+                      name: hf-token
+                - name: NCCL_DEBUG
+                  value: INFO
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        OUTPUT_DIR="/mnt/shared/Meta-Llama-3.1-8B-Instruct" # Must match Python script's output_dir
+                        POD_RANK="${RANK:-0}" # Get rank from env, default to 0
+                        # Define the new request and completion sentinel file paths
+                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request_rank_${POD_RANK}"
+                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed_rank_${POD_RANK}"
+                        TIMEOUT_SECONDS=300 # Max 5 minutes to wait
+                        WAIT_INTERVAL_SECONDS=5 # Check every 5 seconds
+
+                        echo "$(date) PreStop hook: Creating checkpoint request file: ${REQUEST_SENTINEL_FILE}"
+                        touch "${REQUEST_SENTINEL_FILE}" # Create the request sentinel file
+
+                        echo "$(date) PreStop hook: Waiting for checkpoint completion file: ${COMPLETION_SENTINEL_FILE}"
+                        start_time=$(date +%s)
+                        while true; do
+                          if [ -f "${COMPLETION_SENTINEL_FILE}" ]; then
+                            echo "$(date) PreStop hook: Checkpoint completion file found: ${COMPLETION_SENTINEL_FILE}. Checkpoint save confirmed."
+                            rm -f "${COMPLETION_SENTINEL_FILE}" # Clean up
+                            break
+                          fi
+
+                          current_time=$(date +%s)
+                          elapsed_time=$((current_time - start_time))
+
+                          if [ "${elapsed_time}" -ge "${TIMEOUT_SECONDS}" ]; then
+                            echo "$(date) PreStop hook: Timeout (${TIMEOUT_SECONDS}s) reached while waiting for checkpoint completion. Exiting preStop hook with non-zero status to indicate potential issue."
+                            exit 1 # Indicate failure
+                          fi
+
+                          echo "$(date) PreStop hook: Still waiting for checkpoint completion... (${elapsed_time}/${TIMEOUT_SECONDS}s elapsed)"
+                          sleep "${WAIT_INTERVAL_SECONDS}"
+                        done
+                        echo "$(date) PreStop hook finished successfully."
+              image: 'quay.io/modh/training:py311-cuda124-torch251'
+              name: pytorch
+              resources:
+                limits:
+                  cpu: '4'
+                  memory: 64Gi
+                  nvidia.com/gpu: '1'
+                requests:
+                  cpu: '4'
+                  memory: 64Gi
+                  nvidia.com/gpu: '1'
+              volumeMounts:
+                - mountPath: /mnt/shared
+                  name: shared
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: shared
+  runPolicy:
+    suspend: false
