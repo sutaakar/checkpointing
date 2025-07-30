@@ -73,6 +73,8 @@ spec:
                               print(f"[{timestamp}] {message}")
 
                           def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               if torch.cuda.is_available():
                                   self.checkpoint_stream = torch.cuda.Stream()
                                   self._log_message("Created dedicated CUDA stream for checkpointing.")
@@ -90,6 +92,8 @@ spec:
 
 
                           def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               # Check for the request file at each step
                               if not self.checkpoint_requested and os.path.exists(self.request_file):
                                   self._log_message(f"Checkpoint request file detected: {self.request_file}")
@@ -118,10 +122,14 @@ spec:
                                           self.save_triggered = True
 
                           def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               if self.checkpoint_requested:
                                   self._log_message(f"Training ended due to checkpoint request. Final checkpoint should have been saved.")
 
                           def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               self._log_message(f"Save finished.")
                               if self.checkpoint_requested: # Only create completion file if a request was made
                                   try:
@@ -389,6 +397,8 @@ spec:
                               print(f"[{timestamp}] {message}")
 
                           def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               if torch.cuda.is_available():
                                   self.checkpoint_stream = torch.cuda.Stream()
                                   self._log_message("Created dedicated CUDA stream for checkpointing.")
@@ -406,6 +416,8 @@ spec:
 
 
                           def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               # Check for the request file at each step
                               if not self.checkpoint_requested and os.path.exists(self.request_file):
                                   self._log_message(f"Checkpoint request file detected: {self.request_file}")
@@ -434,10 +446,14 @@ spec:
                                           self.save_triggered = True
 
                           def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               if self.checkpoint_requested:
                                   self._log_message(f"Training ended due to checkpoint request. Final checkpoint should have been saved.")
 
                           def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                              if os.environ.get("RANK", "-1") != "0":
+                                  return
                               self._log_message(f"Save finished.")
                               if self.checkpoint_requested: # Only create completion file if a request was made
                                   try:
