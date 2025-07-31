@@ -31,6 +31,8 @@ spec:
                       import torch.serialization
                       torch.serialization.add_safe_globals([_reconstruct, numpy.ndarray, numpy.dtype, numpy.dtypes.UInt32DType])
                       from datetime import datetime
+                      import signal
+                      import torch.distributed as dist
 
                       from datasets import load_dataset
                       from transformers import (
@@ -54,89 +56,105 @@ spec:
                           get_kbit_device_map,
                       )
 
-                      class CheckpointOnDemandCallback(TrainerCallback):
+                      class SigtermCheckpointCallback(TrainerCallback):
                           """
-                          A custom callback to save a checkpoint when a specific sentinel file
-                          is detected, and create a completion sentinel file after saving.
+                          A custom callback to save a checkpoint when SIGTERM is received on any pod,
+                          with distributed coordination across all ranks.
                           """
-                          def __init__(self, output_dir: str, request_file: str, completion_file: str):
+                          def __init__(self, output_dir: str):
                               self.output_dir = output_dir
-                              self.request_file = request_file
-                              self.completion_file = completion_file
                               self.checkpoint_requested = False
                               self.save_triggered = False
                               self.checkpoint_stream = None
+                              self.sigterm_tensor = None  # For distributed signaling
 
                           def _log_message(self, message: str):
                               """Helper to print messages with a timestamp."""
                               timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                               print(f"[{timestamp}] {message}")
 
+                          def _init_distributed_signal_tensor(self):
+                              """Initialize tensor for distributed SIGTERM signaling."""
+                              try:
+                                  if dist.is_initialized():
+                                      device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
+                                      self.sigterm_tensor = torch.zeros(1, dtype=torch.float32, device=device)
+                                      self._log_message(f"Initialized distributed SIGTERM tensor on device: {device}")
+                                  else:
+                                      self._log_message("Distributed training not initialized - using local SIGTERM handling only")
+                              except Exception as e:
+                                  self._log_message(f"Failed to initialize distributed SIGTERM tensor: {e}. Using local handling only.")
+
+                          def _check_distributed_sigterm(self):
+                              """Check if any rank has received SIGTERM."""
+                              try:
+                                  if dist.is_initialized() and self.sigterm_tensor is not None:
+                                      # Check if any rank has signaled SIGTERM
+                                      dist.all_reduce(self.sigterm_tensor, op=dist.ReduceOp.MAX)
+                                      return self.sigterm_tensor.item() > 0.5
+                              except Exception as e:
+                                  # If distributed communication fails, only rely on local signals
+                                  self._log_message(f"Distributed SIGTERM check failed: {e}. Using local signal only.")
+                              return True
+
+                          def _sigterm_handler(self, signum, frame):
+                              """Sets a flag and updates the tensor to indicate that a SIGTERM signal was received."""
+                              rank = os.environ.get("RANK", "-1")
+                              self._log_message(f"Rank {rank}: SIGTERM received, flagging for checkpoint.")
+                              self.checkpoint_requested = True
+                              if self.sigterm_tensor is not None:
+                                  self.sigterm_tensor.fill_(1.0)
+
                           def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
                               rank = os.environ.get("RANK", "-1")
-                              
-                              # All ranks should ensure output directory exists and check for stale files
-                              os.makedirs(self.output_dir, exist_ok=True)
-                              
-                              # Only rank 0 performs the actual cleanup to avoid race conditions
-                              if rank == "0":
-                                  if torch.cuda.is_available():
-                                      self.checkpoint_stream = torch.cuda.Stream()
-                                      self._log_message("Created dedicated CUDA stream for checkpointing.")
 
-                                  # Clean up any stale request file from a previous run
-                                  if os.path.exists(self.request_file):
-                                      os.remove(self.request_file)
-                                      self._log_message(f"Removed stale request file: {self.request_file}")
-                                  # Clean up any stale completion file from a previous run
-                                  if os.path.exists(self.completion_file):
-                                      os.remove(self.completion_file)
-                                      self._log_message(f"Removed stale completion file: {self.completion_file}")
-                              else:
-                                  # Non-rank-0 processes log their participation in cleanup check
-                                  self._log_message(f"Rank {rank}: Verified checkpoint cleanup by rank 0")
+                              # All ranks should ensure output directory exists
+                              os.makedirs(self.output_dir, exist_ok=True)
+
+                              # Initialize distributed signaling tensor for all ranks
+                              self._init_distributed_signal_tensor()
+
+                              # All ranks register SIGTERM handler for distributed coordination
+                              if torch.cuda.is_available():
+                                  self.checkpoint_stream = torch.cuda.Stream()
+                                  self._log_message(f"Rank {rank}: Created dedicated CUDA stream for checkpointing.")
+
+                              # Set up SIGTERM signal handler on all ranks
+                              signal.signal(signal.SIGTERM, self._sigterm_handler)
+                              self._log_message(f"Rank {rank}: SIGTERM signal handler registered for distributed coordination.")
+
+                              # Synchronize all ranks to ensure distributed setup is complete
+                              try:
+                                  if dist.is_initialized():
+                                      dist.barrier()
+                                      self._log_message(f"Rank {rank}: Distributed coordination setup synchronized across all ranks")
+                              except Exception as e:
+                                  self._log_message(f"Rank {rank}: Failed to synchronize distributed setup: {e}")
 
 
                           def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              # Check for the request file at each step
-                              if not self.checkpoint_requested and os.path.exists(self.request_file):
-                                  self._log_message(f"Checkpoint request file detected: {self.request_file}")
-                                  self.checkpoint_requested = True
-
-                                  if not self.save_triggered:
-                                      if self.checkpoint_stream:
-                                          # Ensure all computations on the default stream are complete
-                                          torch.cuda.current_stream().synchronize()
-                                          with torch.cuda.stream(self.checkpoint_stream):
-                                              self._log_message(f"Synchronizing and saving checkpoint at step {state.global_step}...")
-                                              control.should_save = True
-                                              control.should_training_stop = True # Signal Trainer to stop after save
-                                              self.save_triggered = True
-                                      else:
-                                          self._log_message(f"Saving checkpoint at step {state.global_step}...")
-                                          control.should_save = True
-                                          control.should_training_stop = True # Signal Trainer to stop after save
-                                          self.save_triggered = True
+                              # Check if any rank has received the SIGTERM signal
+                              if self._check_distributed_sigterm() and not self.save_triggered:
+                                  rank = os.environ.get("RANK", "-1")
+                                  self._log_message(f"Rank {rank}: Distributed SIGTERM detected, initiating checkpoint at step {state.global_step}.")
+                                  self.save_triggered = True  # Prevent multiple saves
+                                  control.should_save = True
+                                  control.should_training_stop = True
 
                           def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
+                              rank = os.environ.get("RANK", "-1")
+                              if rank != "0":
                                   return
                               if self.checkpoint_requested:
-                                  self._log_message(f"Training ended due to checkpoint request. Final checkpoint should have been saved.")
+                                  self._log_message(f"Rank {rank}: Training ended due to distributed SIGTERM checkpoint request. Final checkpoint should have been saved.")
 
                           def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
+                              rank = os.environ.get("RANK", "-1")
+                              if rank != "0":
                                   return
-                              self._log_message(f"Save finished.")
-                              if self.checkpoint_requested: # Only create completion file if a request was made
-                                  try:
-                                      # Create the completion sentinel file
-                                      rank = os.environ.get('RANK', '0')
-                                      with open(self.completion_file, "w") as f:
-                                          f.write(f"checkpoint saved by rank {rank}\n")
-                                      self._log_message(f"Completion sentinel file created: {self.completion_file}")
-                                  except Exception as e:
-                                      self._log_message(f"Error creating completion sentinel file: {e}")
+                              self._log_message(f"Rank {rank}: Checkpoint save completed.")
+                              if self.checkpoint_requested:
+                                  self._log_message(f"Rank {rank}: Distributed SIGTERM-triggered checkpoint save finished successfully.")
 
 
                       parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
@@ -236,7 +254,7 @@ spec:
                           eval_dataset=test_dataset,
                           peft_config=get_peft_config(model_args),
                           processing_class=tokenizer,
-                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request"), os.path.join(training_args.output_dir, f".checkpoint_completed"))],
+                          callbacks=[SigtermCheckpointCallback(training_args.output_dir)],
                       )
 
                       if trainer.accelerator.is_main_process and hasattr(trainer.model, "print_trainable_parameters"):
@@ -271,44 +289,6 @@ spec:
                       name: hf-token
                 - name: NCCL_DEBUG
                   value: INFO
-              lifecycle:
-                preStop:
-                  exec:
-                    command:
-                      - /bin/sh
-                      - -c
-                      - |
-                        OUTPUT_DIR="/mnt/shared/Meta-Llama-3.1-8B-Instruct" # Must match Python script's output_dir
-                        POD_RANK="${RANK:-0}" # Get rank from env, default to 0
-                        # Define the new request and completion sentinel file paths
-                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request"
-                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed"
-                        TIMEOUT_SECONDS=300 # Max 5 minutes to wait
-                        WAIT_INTERVAL_SECONDS=5 # Check every 5 seconds
-
-                        echo "$(date) PreStop hook: Creating checkpoint request file: ${REQUEST_SENTINEL_FILE}"
-                        touch "${REQUEST_SENTINEL_FILE}" # Create the request sentinel file
-
-                        echo "$(date) PreStop hook: Waiting for checkpoint completion file: ${COMPLETION_SENTINEL_FILE}"
-                        start_time=$(date +%s)
-                        while true; do
-                          if [ -f "${COMPLETION_SENTINEL_FILE}" ]; then
-                            echo "$(date) PreStop hook: Checkpoint completion file found: ${COMPLETION_SENTINEL_FILE}. Checkpoint save confirmed."
-                            break
-                          fi
-
-                          current_time=$(date +%s)
-                          elapsed_time=$((current_time - start_time))
-
-                          if [ "${elapsed_time}" -ge "${TIMEOUT_SECONDS}" ]; then
-                            echo "$(date) PreStop hook: Timeout (${TIMEOUT_SECONDS}s) reached while waiting for checkpoint completion. Exiting preStop hook with non-zero status to indicate potential issue."
-                            exit 1 # Indicate failure
-                          fi
-
-                          echo "$(date) PreStop hook: Still waiting for checkpoint completion... (${elapsed_time}/${TIMEOUT_SECONDS}s elapsed)"
-                          sleep "${WAIT_INTERVAL_SECONDS}"
-                        done
-                        echo "$(date) PreStop hook finished successfully."
               image: 'quay.io/modh/training:py311-cuda124-torch251'
               name: pytorch
               resources:
@@ -351,6 +331,8 @@ spec:
                       import torch.serialization
                       torch.serialization.add_safe_globals([_reconstruct, numpy.ndarray, numpy.dtype, numpy.dtypes.UInt32DType])
                       from datetime import datetime
+                      import signal
+                      import torch.distributed as dist
 
                       from datasets import load_dataset
                       from transformers import (
@@ -374,89 +356,105 @@ spec:
                           get_kbit_device_map,
                       )
 
-                      class CheckpointOnDemandCallback(TrainerCallback):
+                      class SigtermCheckpointCallback(TrainerCallback):
                           """
-                          A custom callback to save a checkpoint when a specific sentinel file
-                          is detected, and create a completion sentinel file after saving.
+                          A custom callback to save a checkpoint when SIGTERM is received on any pod,
+                          with distributed coordination across all ranks.
                           """
-                          def __init__(self, output_dir: str, request_file: str, completion_file: str):
+                          def __init__(self, output_dir: str):
                               self.output_dir = output_dir
-                              self.request_file = request_file
-                              self.completion_file = completion_file
                               self.checkpoint_requested = False
                               self.save_triggered = False
                               self.checkpoint_stream = None
+                              self.sigterm_tensor = None  # For distributed signaling
 
                           def _log_message(self, message: str):
                               """Helper to print messages with a timestamp."""
                               timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                               print(f"[{timestamp}] {message}")
 
+                          def _init_distributed_signal_tensor(self):
+                              """Initialize tensor for distributed SIGTERM signaling."""
+                              try:
+                                  if dist.is_initialized():
+                                      device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
+                                      self.sigterm_tensor = torch.zeros(1, dtype=torch.float32, device=device)
+                                      self._log_message(f"Initialized distributed SIGTERM tensor on device: {device}")
+                                  else:
+                                      self._log_message("Distributed training not initialized - using local SIGTERM handling only")
+                              except Exception as e:
+                                  self._log_message(f"Failed to initialize distributed SIGTERM tensor: {e}. Using local handling only.")
+
+                          def _check_distributed_sigterm(self):
+                              """Check if any rank has received SIGTERM."""
+                              try:
+                                  if dist.is_initialized() and self.sigterm_tensor is not None:
+                                      # Check if any rank has signaled SIGTERM
+                                      dist.all_reduce(self.sigterm_tensor, op=dist.ReduceOp.MAX)
+                                      return self.sigterm_tensor.item() > 0.5
+                              except Exception as e:
+                                  # If distributed communication fails, only rely on local signals
+                                  self._log_message(f"Distributed SIGTERM check failed: {e}. Using local signal only.")
+                              return True
+
+                          def _sigterm_handler(self, signum, frame):
+                              """Sets a flag and updates the tensor to indicate that a SIGTERM signal was received."""
+                              rank = os.environ.get("RANK", "-1")
+                              self._log_message(f"Rank {rank}: SIGTERM received, flagging for checkpoint.")
+                              self.checkpoint_requested = True
+                              if self.sigterm_tensor is not None:
+                                  self.sigterm_tensor.fill_(1.0)
+
                           def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
                               rank = os.environ.get("RANK", "-1")
-                              
-                              # All ranks should ensure output directory exists and check for stale files
-                              os.makedirs(self.output_dir, exist_ok=True)
-                              
-                              # Only rank 0 performs the actual cleanup to avoid race conditions
-                              if rank == "0":
-                                  if torch.cuda.is_available():
-                                      self.checkpoint_stream = torch.cuda.Stream()
-                                      self._log_message("Created dedicated CUDA stream for checkpointing.")
 
-                                  # Clean up any stale request file from a previous run
-                                  if os.path.exists(self.request_file):
-                                      os.remove(self.request_file)
-                                      self._log_message(f"Removed stale request file: {self.request_file}")
-                                  # Clean up any stale completion file from a previous run
-                                  if os.path.exists(self.completion_file):
-                                      os.remove(self.completion_file)
-                                      self._log_message(f"Removed stale completion file: {self.completion_file}")
-                              else:
-                                  # Non-rank-0 processes log their participation in cleanup check
-                                  self._log_message(f"Rank {rank}: Verified checkpoint cleanup by rank 0")
+                              # All ranks should ensure output directory exists
+                              os.makedirs(self.output_dir, exist_ok=True)
+
+                              # Initialize distributed signaling tensor for all ranks
+                              self._init_distributed_signal_tensor()
+
+                              # All ranks register SIGTERM handler for distributed coordination
+                              if torch.cuda.is_available():
+                                  self.checkpoint_stream = torch.cuda.Stream()
+                                  self._log_message(f"Rank {rank}: Created dedicated CUDA stream for checkpointing.")
+
+                              # Set up SIGTERM signal handler on all ranks
+                              signal.signal(signal.SIGTERM, self._sigterm_handler)
+                              self._log_message(f"Rank {rank}: SIGTERM signal handler registered for distributed coordination.")
+
+                              # Synchronize all ranks to ensure distributed setup is complete
+                              try:
+                                  if dist.is_initialized():
+                                      dist.barrier()
+                                      self._log_message(f"Rank {rank}: Distributed coordination setup synchronized across all ranks")
+                              except Exception as e:
+                                  self._log_message(f"Rank {rank}: Failed to synchronize distributed setup: {e}")
 
 
                           def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              # Check for the request file at each step
-                              if not self.checkpoint_requested and os.path.exists(self.request_file):
-                                  self._log_message(f"Checkpoint request file detected: {self.request_file}")
-                                  self.checkpoint_requested = True
-
-                                  if not self.save_triggered:
-                                      if self.checkpoint_stream:
-                                          # Ensure all computations on the default stream are complete
-                                          torch.cuda.current_stream().synchronize()
-                                          with torch.cuda.stream(self.checkpoint_stream):
-                                              self._log_message(f"Synchronizing and saving checkpoint at step {state.global_step}...")
-                                              control.should_save = True
-                                              control.should_training_stop = True # Signal Trainer to stop after save
-                                              self.save_triggered = True
-                                      else:
-                                          self._log_message(f"Saving checkpoint at step {state.global_step}...")
-                                          control.should_save = True
-                                          control.should_training_stop = True # Signal Trainer to stop after save
-                                          self.save_triggered = True
+                              # Check if any rank has received the SIGTERM signal
+                              if self._check_distributed_sigterm() and not self.save_triggered:
+                                  rank = os.environ.get("RANK", "-1")
+                                  self._log_message(f"Rank {rank}: Distributed SIGTERM detected, initiating checkpoint at step {state.global_step}.")
+                                  self.save_triggered = True  # Prevent multiple saves
+                                  control.should_save = True
+                                  control.should_training_stop = True
 
                           def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
+                              rank = os.environ.get("RANK", "-1")
+                              if rank != "0":
                                   return
                               if self.checkpoint_requested:
-                                  self._log_message(f"Training ended due to checkpoint request. Final checkpoint should have been saved.")
+                                  self._log_message(f"Rank {rank}: Training ended due to distributed SIGTERM checkpoint request. Final checkpoint should have been saved.")
 
                           def on_save(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
+                              rank = os.environ.get("RANK", "-1")
+                              if rank != "0":
                                   return
-                              self._log_message(f"Save finished.")
-                              if self.checkpoint_requested: # Only create completion file if a request was made
-                                  try:
-                                      # Create the completion sentinel file
-                                      rank = os.environ.get('RANK', '0')
-                                      with open(self.completion_file, "w") as f:
-                                          f.write(f"checkpoint saved by rank {rank}\n")
-                                      self._log_message(f"Completion sentinel file created: {self.completion_file}")
-                                  except Exception as e:
-                                      self._log_message(f"Error creating completion sentinel file: {e}")
+                              self._log_message(f"Rank {rank}: Checkpoint save completed.")
+                              if self.checkpoint_requested:
+                                  self._log_message(f"Rank {rank}: Distributed SIGTERM-triggered checkpoint save finished successfully.")
 
 
                       parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
@@ -556,7 +554,7 @@ spec:
                           eval_dataset=test_dataset,
                           peft_config=get_peft_config(model_args),
                           processing_class=tokenizer,
-                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request"), os.path.join(training_args.output_dir, f".checkpoint_completed"))],
+                          callbacks=[SigtermCheckpointCallback(training_args.output_dir)],
                       )
 
                       if trainer.accelerator.is_main_process and hasattr(trainer.model, "print_trainable_parameters"):
@@ -591,44 +589,6 @@ spec:
                       name: hf-token
                 - name: NCCL_DEBUG
                   value: INFO
-              lifecycle:
-                preStop:
-                  exec:
-                    command:
-                      - /bin/sh
-                      - -c
-                      - |
-                        OUTPUT_DIR="/mnt/shared/Meta-Llama-3.1-8B-Instruct" # Must match Python script's output_dir
-                        POD_RANK="${RANK:-0}" # Get rank from env, default to 0
-                        # Define the new request and completion sentinel file paths
-                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request"
-                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed"
-                        TIMEOUT_SECONDS=300 # Max 5 minutes to wait
-                        WAIT_INTERVAL_SECONDS=5 # Check every 5 seconds
-
-                        echo "$(date) PreStop hook: Creating checkpoint request file: ${REQUEST_SENTINEL_FILE}"
-                        touch "${REQUEST_SENTINEL_FILE}" # Create the request sentinel file
-
-                        echo "$(date) PreStop hook: Waiting for checkpoint completion file: ${COMPLETION_SENTINEL_FILE}"
-                        start_time=$(date +%s)
-                        while true; do
-                          if [ -f "${COMPLETION_SENTINEL_FILE}" ]; then
-                            echo "$(date) PreStop hook: Checkpoint completion file found: ${COMPLETION_SENTINEL_FILE}. Checkpoint save confirmed."
-                            break
-                          fi
-
-                          current_time=$(date +%s)
-                          elapsed_time=$((current_time - start_time))
-
-                          if [ "${elapsed_time}" -ge "${TIMEOUT_SECONDS}" ]; then
-                            echo "$(date) PreStop hook: Timeout (${TIMEOUT_SECONDS}s) reached while waiting for checkpoint completion. Exiting preStop hook with non-zero status to indicate potential issue."
-                            exit 1 # Indicate failure
-                          fi
-
-                          echo "$(date) PreStop hook: Still waiting for checkpoint completion... (${elapsed_time}/${TIMEOUT_SECONDS}s elapsed)"
-                          sleep "${WAIT_INTERVAL_SECONDS}"
-                        done
-                        echo "$(date) PreStop hook finished successfully."
               image: 'quay.io/modh/training:py311-cuda124-torch251'
               name: pytorch
               resources:
