@@ -73,38 +73,35 @@ spec:
                               print(f"[{timestamp}] {message}")
 
                           def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
-                                  return
-                              if torch.cuda.is_available():
-                                  self.checkpoint_stream = torch.cuda.Stream()
-                                  self._log_message("Created dedicated CUDA stream for checkpointing.")
-
-                              # Ensure the output directory exists for sentinel files
+                              rank = os.environ.get("RANK", "-1")
+                              
+                              # All ranks should ensure output directory exists and check for stale files
                               os.makedirs(self.output_dir, exist_ok=True)
-                              # Clean up any stale request file from a previous run
-                              if os.path.exists(self.request_file):
-                                  os.remove(self.request_file)
-                                  self._log_message(f"Removed stale request file: {self.request_file}")
-                              # Clean up any stale completion file from a previous run
-                              if os.path.exists(self.completion_file):
-                                  os.remove(self.completion_file)
-                                  self._log_message(f"Removed stale completion file: {self.completion_file}")
+                              
+                              # Only rank 0 performs the actual cleanup to avoid race conditions
+                              if rank == "0":
+                                  if torch.cuda.is_available():
+                                      self.checkpoint_stream = torch.cuda.Stream()
+                                      self._log_message("Created dedicated CUDA stream for checkpointing.")
+
+                                  # Clean up any stale request file from a previous run
+                                  if os.path.exists(self.request_file):
+                                      os.remove(self.request_file)
+                                      self._log_message(f"Removed stale request file: {self.request_file}")
+                                  # Clean up any stale completion file from a previous run
+                                  if os.path.exists(self.completion_file):
+                                      os.remove(self.completion_file)
+                                      self._log_message(f"Removed stale completion file: {self.completion_file}")
+                              else:
+                                  # Non-rank-0 processes log their participation in cleanup check
+                                  self._log_message(f"Rank {rank}: Verified checkpoint cleanup by rank 0")
 
 
                           def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
-                                  return
                               # Check for the request file at each step
                               if not self.checkpoint_requested and os.path.exists(self.request_file):
                                   self._log_message(f"Checkpoint request file detected: {self.request_file}")
                                   self.checkpoint_requested = True
-
-                                  # Remove the request file to acknowledge it
-                                  try:
-                                      os.remove(self.request_file)
-                                      self._log_message(f"Removed checkpoint request file: {self.request_file}")
-                                  except OSError as e:
-                                      self._log_message(f"Error removing request file {self.request_file}: {e}")
 
                                   if not self.save_triggered:
                                       if self.checkpoint_stream:
@@ -239,7 +236,7 @@ spec:
                           eval_dataset=test_dataset,
                           peft_config=get_peft_config(model_args),
                           processing_class=tokenizer,
-                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request_rank_{os.environ.get('RANK', '0')}"), os.path.join(training_args.output_dir, f".checkpoint_completed_rank_{os.environ.get('RANK', '0')}" ))],
+                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request"), os.path.join(training_args.output_dir, f".checkpoint_completed"))],
                       )
 
                       if trainer.accelerator.is_main_process and hasattr(trainer.model, "print_trainable_parameters"):
@@ -256,7 +253,7 @@ spec:
                       with training_args.main_process_first(desc="Training completed"):
                           print(f"Training completed, model checkpoint written to {training_args.output_dir}")
 
-                  main({'model_name_or_path': 'meta-llama/Llama-3.2-1B-Instruct', 'model_revision': 'main', 'torch_dtype': 'bfloat16', 'attn_implementation': 'flash_attention_2', 'use_liger': False, 'use_peft': True, 'lora_r': 16, 'lora_alpha': 8, 'lora_dropout': 0.05, 'lora_target_modules': ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], 'lora_modules_to_save': [], 'load_in_4bit': False, 'load_in_8bit': False, 'dataset_name': 'gsm8k', 'dataset_config': 'main', 'dataset_train_split': 'train', 'dataset_test_split': 'test', 'dataset_text_field': 'text', 'dataset_kwargs': {'add_special_tokens': False, 'append_concat_token': False}, 'max_seq_length': 1024, 'dataset_batch_size': 1000, 'packing': False, 'num_train_epochs': 1, 'per_device_train_batch_size': 32, 'per_device_eval_batch_size': 32, 'auto_find_batch_size': False, 'eval_strategy': 'epoch', 'bf16': True, 'tf32': False, 'learning_rate': 0.0002, 'warmup_steps': 10, 'lr_scheduler_type': 'inverse_sqrt', 'optim': 'adamw_torch_fused', 'max_grad_norm': 1.0, 'seed': 42, 'gradient_accumulation_steps': 1, 'gradient_checkpointing': False, 'gradient_checkpointing_kwargs': {'use_reentrant': False}, 'fsdp': 'full_shard auto_wrap', 'fsdp_config': {'activation_checkpointing': True, 'cpu_ram_efficient_loading': False, 'sync_module_states': True, 'use_orig_params': True, 'limit_all_gathers': False}, 'save_strategy': 'steps', 'save_total_limit': 1, 'save_steps': 10, 'log_level': 'warning', 'logging_strategy': 'steps', 'logging_steps': 1, 'report_to': ['tensorboard'], 'output_dir': '/mnt/shared/Meta-Llama-3.1-8B-Instruct'})
+                  main({'model_name_or_path': 'meta-llama/Llama-3.2-1B-Instruct', 'model_revision': 'main', 'torch_dtype': 'bfloat16', 'attn_implementation': 'flash_attention_2', 'use_liger': False, 'use_peft': True, 'lora_r': 16, 'lora_alpha': 8, 'lora_dropout': 0.05, 'lora_target_modules': ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], 'lora_modules_to_save': [], 'load_in_4bit': False, 'load_in_8bit': False, 'dataset_name': 'gsm8k', 'dataset_config': 'main', 'dataset_train_split': 'train', 'dataset_test_split': 'test', 'dataset_text_field': 'text', 'dataset_kwargs': {'add_special_tokens': False, 'append_concat_token': False}, 'max_seq_length': 1024, 'dataset_batch_size': 1000, 'packing': False, 'num_train_epochs': 1, 'per_device_train_batch_size': 32, 'per_device_eval_batch_size': 32, 'auto_find_batch_size': False, 'eval_strategy': 'epoch', 'bf16': True, 'tf32': False, 'learning_rate': 0.0002, 'warmup_steps': 10, 'lr_scheduler_type': 'inverse_sqrt', 'optim': 'adamw_torch_fused', 'max_grad_norm': 1.0, 'seed': 42, 'gradient_accumulation_steps': 1, 'gradient_checkpointing': False, 'gradient_checkpointing_kwargs': {'use_reentrant': False}, 'fsdp': 'full_shard auto_wrap', 'fsdp_config': {'activation_checkpointing': True, 'cpu_ram_efficient_loading': False, 'sync_module_states': True, 'use_orig_params': True, 'limit_all_gathers': False}, 'save_strategy': 'no', 'save_total_limit': 1, 'log_level': 'warning', 'logging_strategy': 'steps', 'logging_steps': 1, 'report_to': ['tensorboard'], 'output_dir': '/mnt/shared/Meta-Llama-3.1-8B-Instruct'})
 
                   EOM
                   printf "%s" "$SCRIPT" > "$program_path/ephemeral_script.py"
@@ -284,8 +281,8 @@ spec:
                         OUTPUT_DIR="/mnt/shared/Meta-Llama-3.1-8B-Instruct" # Must match Python script's output_dir
                         POD_RANK="${RANK:-0}" # Get rank from env, default to 0
                         # Define the new request and completion sentinel file paths
-                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request_rank_${POD_RANK}"
-                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed_rank_${POD_RANK}"
+                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request"
+                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed"
                         TIMEOUT_SECONDS=300 # Max 5 minutes to wait
                         WAIT_INTERVAL_SECONDS=5 # Check every 5 seconds
 
@@ -297,7 +294,6 @@ spec:
                         while true; do
                           if [ -f "${COMPLETION_SENTINEL_FILE}" ]; then
                             echo "$(date) PreStop hook: Checkpoint completion file found: ${COMPLETION_SENTINEL_FILE}. Checkpoint save confirmed."
-                            rm -f "${COMPLETION_SENTINEL_FILE}" # Clean up
                             break
                           fi
 
@@ -397,38 +393,35 @@ spec:
                               print(f"[{timestamp}] {message}")
 
                           def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
-                                  return
-                              if torch.cuda.is_available():
-                                  self.checkpoint_stream = torch.cuda.Stream()
-                                  self._log_message("Created dedicated CUDA stream for checkpointing.")
-
-                              # Ensure the output directory exists for sentinel files
+                              rank = os.environ.get("RANK", "-1")
+                              
+                              # All ranks should ensure output directory exists and check for stale files
                               os.makedirs(self.output_dir, exist_ok=True)
-                              # Clean up any stale request file from a previous run
-                              if os.path.exists(self.request_file):
-                                  os.remove(self.request_file)
-                                  self._log_message(f"Removed stale request file: {self.request_file}")
-                              # Clean up any stale completion file from a previous run
-                              if os.path.exists(self.completion_file):
-                                  os.remove(self.completion_file)
-                                  self._log_message(f"Removed stale completion file: {self.completion_file}")
+                              
+                              # Only rank 0 performs the actual cleanup to avoid race conditions
+                              if rank == "0":
+                                  if torch.cuda.is_available():
+                                      self.checkpoint_stream = torch.cuda.Stream()
+                                      self._log_message("Created dedicated CUDA stream for checkpointing.")
+
+                                  # Clean up any stale request file from a previous run
+                                  if os.path.exists(self.request_file):
+                                      os.remove(self.request_file)
+                                      self._log_message(f"Removed stale request file: {self.request_file}")
+                                  # Clean up any stale completion file from a previous run
+                                  if os.path.exists(self.completion_file):
+                                      os.remove(self.completion_file)
+                                      self._log_message(f"Removed stale completion file: {self.completion_file}")
+                              else:
+                                  # Non-rank-0 processes log their participation in cleanup check
+                                  self._log_message(f"Rank {rank}: Verified checkpoint cleanup by rank 0")
 
 
                           def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-                              if os.environ.get("RANK", "-1") != "0":
-                                  return
                               # Check for the request file at each step
                               if not self.checkpoint_requested and os.path.exists(self.request_file):
                                   self._log_message(f"Checkpoint request file detected: {self.request_file}")
                                   self.checkpoint_requested = True
-
-                                  # Remove the request file to acknowledge it
-                                  try:
-                                      os.remove(self.request_file)
-                                      self._log_message(f"Removed checkpoint request file: {self.request_file}")
-                                  except OSError as e:
-                                      self._log_message(f"Error removing request file {self.request_file}: {e}")
 
                                   if not self.save_triggered:
                                       if self.checkpoint_stream:
@@ -563,7 +556,7 @@ spec:
                           eval_dataset=test_dataset,
                           peft_config=get_peft_config(model_args),
                           processing_class=tokenizer,
-                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request_rank_{os.environ.get('RANK', '0')}"), os.path.join(training_args.output_dir, f".checkpoint_completed_rank_{os.environ.get('RANK', '0')}" ))],
+                          callbacks=[CheckpointOnDemandCallback(training_args.output_dir, os.path.join(training_args.output_dir, f".checkpoint_request"), os.path.join(training_args.output_dir, f".checkpoint_completed"))],
                       )
 
                       if trainer.accelerator.is_main_process and hasattr(trainer.model, "print_trainable_parameters"):
@@ -580,7 +573,7 @@ spec:
                       with training_args.main_process_first(desc="Training completed"):
                           print(f"Training completed, model checkpoint written to {training_args.output_dir}")
 
-                  main({'model_name_or_path': 'meta-llama/Llama-3.2-1B-Instruct', 'model_revision': 'main', 'torch_dtype': 'bfloat16', 'attn_implementation': 'flash_attention_2', 'use_liger': False, 'use_peft': True, 'lora_r': 16, 'lora_alpha': 8, 'lora_dropout': 0.05, 'lora_target_modules': ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], 'lora_modules_to_save': [], 'load_in_4bit': False, 'load_in_8bit': False, 'dataset_name': 'gsm8k', 'dataset_config': 'main', 'dataset_train_split': 'train', 'dataset_test_split': 'test', 'dataset_text_field': 'text', 'dataset_kwargs': {'add_special_tokens': False, 'append_concat_token': False}, 'max_seq_length': 1024, 'dataset_batch_size': 1000, 'packing': False, 'num_train_epochs': 1, 'per_device_train_batch_size': 32, 'per_device_eval_batch_size': 32, 'auto_find_batch_size': False, 'eval_strategy': 'epoch', 'bf16': True, 'tf32': False, 'learning_rate': 0.0002, 'warmup_steps': 10, 'lr_scheduler_type': 'inverse_sqrt', 'optim': 'adamw_torch_fused', 'max_grad_norm': 1.0, 'seed': 42, 'gradient_accumulation_steps': 1, 'gradient_checkpointing': False, 'gradient_checkpointing_kwargs': {'use_reentrant': False}, 'fsdp': 'full_shard auto_wrap', 'fsdp_config': {'activation_checkpointing': True, 'cpu_ram_efficient_loading': False, 'sync_module_states': True, 'use_orig_params': True, 'limit_all_gathers': False}, 'save_strategy': 'steps', 'save_total_limit': 1, 'save_steps': 10, 'log_level': 'warning', 'logging_strategy': 'steps', 'logging_steps': 1, 'report_to': ['tensorboard'], 'output_dir': '/mnt/shared/Meta-Llama-3.1-8B-Instruct'})
+                  main({'model_name_or_path': 'meta-llama/Llama-3.2-1B-Instruct', 'model_revision': 'main', 'torch_dtype': 'bfloat16', 'attn_implementation': 'flash_attention_2', 'use_liger': False, 'use_peft': True, 'lora_r': 16, 'lora_alpha': 8, 'lora_dropout': 0.05, 'lora_target_modules': ['q_proj', 'v_proj', 'k_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'], 'lora_modules_to_save': [], 'load_in_4bit': False, 'load_in_8bit': False, 'dataset_name': 'gsm8k', 'dataset_config': 'main', 'dataset_train_split': 'train', 'dataset_test_split': 'test', 'dataset_text_field': 'text', 'dataset_kwargs': {'add_special_tokens': False, 'append_concat_token': False}, 'max_seq_length': 1024, 'dataset_batch_size': 1000, 'packing': False, 'num_train_epochs': 1, 'per_device_train_batch_size': 32, 'per_device_eval_batch_size': 32, 'auto_find_batch_size': False, 'eval_strategy': 'epoch', 'bf16': True, 'tf32': False, 'learning_rate': 0.0002, 'warmup_steps': 10, 'lr_scheduler_type': 'inverse_sqrt', 'optim': 'adamw_torch_fused', 'max_grad_norm': 1.0, 'seed': 42, 'gradient_accumulation_steps': 1, 'gradient_checkpointing': False, 'gradient_checkpointing_kwargs': {'use_reentrant': False}, 'fsdp': 'full_shard auto_wrap', 'fsdp_config': {'activation_checkpointing': True, 'cpu_ram_efficient_loading': False, 'sync_module_states': True, 'use_orig_params': True, 'limit_all_gathers': False}, 'save_strategy': 'no', 'save_total_limit': 1, 'log_level': 'warning', 'logging_strategy': 'steps', 'logging_steps': 1, 'report_to': ['tensorboard'], 'output_dir': '/mnt/shared/Meta-Llama-3.1-8B-Instruct'})
 
                   EOM
                   printf "%s" "$SCRIPT" > "$program_path/ephemeral_script.py"
@@ -608,8 +601,8 @@ spec:
                         OUTPUT_DIR="/mnt/shared/Meta-Llama-3.1-8B-Instruct" # Must match Python script's output_dir
                         POD_RANK="${RANK:-0}" # Get rank from env, default to 0
                         # Define the new request and completion sentinel file paths
-                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request_rank_${POD_RANK}"
-                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed_rank_${POD_RANK}"
+                        REQUEST_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_request"
+                        COMPLETION_SENTINEL_FILE="${OUTPUT_DIR}/.checkpoint_completed"
                         TIMEOUT_SECONDS=300 # Max 5 minutes to wait
                         WAIT_INTERVAL_SECONDS=5 # Check every 5 seconds
 
@@ -621,7 +614,6 @@ spec:
                         while true; do
                           if [ -f "${COMPLETION_SENTINEL_FILE}" ]; then
                             echo "$(date) PreStop hook: Checkpoint completion file found: ${COMPLETION_SENTINEL_FILE}. Checkpoint save confirmed."
-                            rm -f "${COMPLETION_SENTINEL_FILE}" # Clean up
                             break
                           fi
 
