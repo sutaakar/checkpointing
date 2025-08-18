@@ -46,17 +46,6 @@ class KServeDeployer:
             description='Namespace:',
             style={'description_width': 'initial'}
         )
-        self.custom_namespace_enabled = widgets.Checkbox(
-            value=False,
-            description='Use custom namespace',
-            style={'description_width': 'initial'}
-        )
-        self.custom_namespace_text = widgets.Text(
-            placeholder='Enter custom namespace',
-            description='Custom namespace:',
-            style={'description_width': 'initial'},
-            disabled=True
-        )
         self.checkpoints_dropdown = widgets.Dropdown(
             options=[],
             description='Checkpoints:',
@@ -76,16 +65,11 @@ class KServeDeployer:
         # Link button to its function
         self.create_button.on_click(self._create_inference_service)
         
-        # Link checkbox to enable/disable custom namespace
-        self.custom_namespace_enabled.observe(self._on_custom_namespace_change, names='value')
-        
         # The VBox holds all our UI elements
         self.ui = widgets.VBox([
             self.kube_api_server, 
             self.kube_token, 
             self.namespace_dropdown,
-            self.custom_namespace_enabled,
-            self.custom_namespace_text,
             self.checkpoints_dropdown, 
             self.inference_service_name, 
             self.create_button, 
@@ -130,21 +114,9 @@ class KServeDeployer:
         if self.current_namespace:
             self.namespace_dropdown.value = self.current_namespace
     
-    def _on_custom_namespace_change(self, change):
-        """Handles changes to the custom namespace checkbox."""
-        if change['new']:  # Checkbox is checked
-            self.custom_namespace_text.disabled = False
-            self.namespace_dropdown.disabled = True
-        else:  # Checkbox is unchecked
-            self.custom_namespace_text.disabled = True
-            self.namespace_dropdown.disabled = False
-            
     def _get_selected_namespace(self):
         """Returns the currently selected namespace."""
-        if self.custom_namespace_enabled.value and self.custom_namespace_text.value.strip():
-            return self.custom_namespace_text.value.strip()
-        else:
-            return self.namespace_dropdown.value
+        return self.namespace_dropdown.value
 
     def _create_inference_service(self, b):
         """Creates an InferenceService object when the button is clicked."""
