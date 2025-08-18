@@ -84,14 +84,14 @@ class KServeDeployer:
             layout=widgets.Layout(width='120px')
         )
         self.scan_checkpoints_button = widgets.Button(
-            description='Scan for Checkpoints',
+            description='Scan for Checkpoint Folders',
             button_style='warning',
             icon='search',
-            layout=widgets.Layout(width='160px')
+            layout=widgets.Layout(width='180px')
         )
         self.monitor_logs_checkbox = widgets.Checkbox(
             value=False,
-            description='Monitor PyTorchJob logs for new checkpoints',
+            description='Monitor PyTorchJob logs for new checkpoint folders',
             style={'description_width': 'initial'},
             layout={'width': 'max-content'}
         )
@@ -151,6 +151,34 @@ class KServeDeployer:
             self.output
         ])
 
+    def _extract_checkpoint_directory(self, matched_path, pattern_index):
+        """Extracts checkpoint directory from matched path, handling both files and directories."""
+        import os
+        
+        # File patterns are indices 6-9 in our pattern list (0-based)
+        # These patterns match individual files and we need to extract their directory
+        file_pattern_indices = {6, 7, 8, 9}
+        
+        if pattern_index in file_pattern_indices:
+            # For file patterns, extract the directory containing the file
+            if matched_path.startswith('/'):
+                # It's a full path to a file, get the directory
+                directory = os.path.dirname(matched_path)
+                if directory and directory != '/':
+                    return directory
+            else:
+                # It's likely just a filename without path, skip it
+                return None
+        else:
+            # For directory patterns, use the path as-is (it should already be a directory)
+            # But ensure it doesn't end with a filename
+            if matched_path and matched_path.startswith('/'):
+                # Check if it looks like a directory path (no file extension at the end)
+                if not re.search(r'\.[a-zA-Z]{2,4}$', matched_path):
+                    return matched_path
+            
+        return None
+    
     def _map_checkpoint_path(self, training_path):
         """Maps a training checkpoint path to deployment path."""
         # Apply user-defined path mapping
@@ -183,16 +211,16 @@ class KServeDeployer:
             self.create_button.disabled = True
             self.checkpoints_dropdown.options = []
             with self.output:
-                print("No checkpoints detected yet.")
-                print("💡 Start PyTorchJob log monitoring to automatically detect checkpoints.")
+                print("No checkpoint folders detected yet.")
+                print("💡 Start PyTorchJob log monitoring to automatically detect checkpoint folders.")
         else:
             self.checkpoints_dropdown.disabled = False
             self.create_button.disabled = False
             self.checkpoints_dropdown.options = checkpoints
             with self.output:
-                print(f"✅ Found {len(checkpoints)} checkpoint(s) from PyTorchJob logs:")
+                print(f"✅ Found {len(checkpoints)} checkpoint folder(s) from PyTorchJob logs:")
                 for cp in checkpoints:
-                    print(f"  - {cp}")
+                    print(f"  📁 {cp}")
                     
                 if self.path_mapping:
                     print(f"\n📍 Applied path mapping: {self.path_mapping}")
@@ -311,14 +339,14 @@ class KServeDeployer:
         selected_job = self.pytorchjob_dropdown.value
         if not selected_job:
             with self.output:
-                print("⚠️  Please select a PyTorchJob to scan for checkpoints")
+                print("⚠️  Please select a PyTorchJob to scan for checkpoint folders")
             return
             
         # Extract job name (remove status indicator)
         job_name = selected_job.split(' (')[0]
         
         with self.output:
-            print(f"🔍 Manually scanning PyTorchJob '{job_name}' for checkpoints...")
+            print(f"🔍 Manually scanning PyTorchJob '{job_name}' for checkpoint folders...")
         
         self._scan_job_for_checkpoints(job_name)
         
@@ -389,18 +417,21 @@ class KServeDeployer:
             api_client = client.ApiClient(configuration)
             v1 = client.CoreV1Api(api_client)
             
-            # Checkpoint detection patterns (same as monitoring worker)
+            # Checkpoint detection patterns - focus on directories only
             checkpoint_patterns = [
+                # Directory patterns (common in transformers/pytorch lightning)
                 r'saving.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)',
                 r'saved.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)', 
                 r'checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
                 r'saving.*?model.*?to\s+([/\w\-\./]+)',
                 r'saving model checkpoint to\s+([/\w\-\./]+)',
                 r'model.*?checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
-                r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
-                r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
-                r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
-                r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                # File patterns - but we'll extract the directory containing the file
+                r'saved checkpoint.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                r'saving.*?checkpoint.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                r'checkpoint.*?saved.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                r'model.*?saved.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                # Generic patterns
                 r'saving.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)',
                 r'saved.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)'
             ]
@@ -468,19 +499,24 @@ class KServeDeployer:
                         for i, pattern in enumerate(checkpoint_patterns):
                             match = re.search(pattern, line, re.IGNORECASE)
                             if match:
-                                checkpoint_path = match.group(1)
-                                timestamp = datetime.now().strftime("%H:%M:%S")
+                                matched_path = match.group(1)
                                 
-                                # Add to detected checkpoints if new
-                                if checkpoint_path not in self.detected_checkpoints:
-                                    self.detected_checkpoints.add(checkpoint_path)
-                                    checkpoints_found_this_scan.add(checkpoint_path)
-                                    self.last_checkpoint_time[checkpoint_path] = timestamp
+                                # Convert to directory path if it's a file
+                                checkpoint_path = self._extract_checkpoint_directory(matched_path, i)
+                                
+                                if checkpoint_path:  # Only proceed if we got a valid directory
+                                    timestamp = datetime.now().strftime("%H:%M:%S")
                                     
-                                    with self.output:
-                                        print(f"✅ Found checkpoint in log: {checkpoint_path}")
-                                else:
-                                    checkpoints_found_this_scan.add(checkpoint_path)
+                                    # Add to detected checkpoints if new
+                                    if checkpoint_path not in self.detected_checkpoints:
+                                        self.detected_checkpoints.add(checkpoint_path)
+                                        checkpoints_found_this_scan.add(checkpoint_path)
+                                        self.last_checkpoint_time[checkpoint_path] = timestamp
+                                        
+                                        with self.output:
+                                            print(f"✅ Found checkpoint folder: {checkpoint_path}")
+                                    else:
+                                        checkpoints_found_this_scan.add(checkpoint_path)
                                 break
                     
                     with self.output:
@@ -499,13 +535,13 @@ class KServeDeployer:
             # Update UI with results
             if checkpoints_found_this_scan:
                 with self.output:
-                    print(f"🎉 Initial scan complete: Found {len(checkpoints_found_this_scan)} checkpoint(s)")
+                    print(f"🎉 Initial scan complete: Found {len(checkpoints_found_this_scan)} checkpoint folder(s)")
                     for cp in sorted(checkpoints_found_this_scan):
                         print(f"  📁 {cp}")
                 self.update_checkpoints_dropdown()
             else:
                 with self.output:
-                    print("📭 No checkpoints found in job logs")
+                    print("📭 No checkpoint folders found in job logs")
                     
         except Exception as e:
             with self.output:
@@ -530,21 +566,20 @@ class KServeDeployer:
             with self.output:
                 print(f"🔍 Starting log monitoring for PyTorchJob '{job_name}' in namespace '{namespace}'")
             
-            # Improved checkpoint detection patterns - handle both files and directories
+            # Checkpoint detection patterns - focus on directories only
             checkpoint_patterns = [
-                # Directory patterns (common in transformers/pytorch lightning) - Fixed regex
+                # Directory patterns (common in transformers/pytorch lightning)
                 r'saving.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)',
                 r'saved.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)', 
                 r'checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
                 r'saving.*?model.*?to\s+([/\w\-\./]+)',
-                # More comprehensive model checkpoint patterns
                 r'saving model checkpoint to\s+([/\w\-\./]+)',
                 r'model.*?checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
-                # File patterns (traditional checkpoints)
-                r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
-                r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
-                r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
-                r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                # File patterns - but we'll extract the directory containing the file
+                r'saved checkpoint.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                r'saving.*?checkpoint.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                r'checkpoint.*?saved.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
+                r'model.*?saved.*?(\S+)\.(?:ckpt|pt|pth|bin|safetensors)',
                 # Generic patterns
                 r'saving.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)',
                 r'saved.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)'
@@ -637,29 +672,34 @@ class KServeDeployer:
                                 for i, pattern in enumerate(checkpoint_patterns):
                                     match = re.search(pattern, line, re.IGNORECASE)
                                     if match:
-                                        checkpoint_path = match.group(1)
-                                        timestamp = datetime.now().strftime("%H:%M:%S")
+                                        matched_path = match.group(1)
                                         
-                                        with self.output:
-                                            print(f"✅ [Pattern {i+1}] Found checkpoint pattern in log line: {line}")
-                                            print(f"📁 Extracted checkpoint path: {checkpoint_path}")
+                                        # Convert to directory path if it's a file
+                                        checkpoint_path = self._extract_checkpoint_directory(matched_path, i)
                                         
-                                        # Avoid duplicate notifications for the same checkpoint
-                                        if checkpoint_path not in self.last_checkpoint_time:
-                                            self.last_checkpoint_time[checkpoint_path] = timestamp
+                                        if checkpoint_path:  # Only proceed if we got a valid directory
+                                            timestamp = datetime.now().strftime("%H:%M:%S")
                                             
-                                            # Add to detected checkpoints for prioritized listing
-                                            self.detected_checkpoints.add(checkpoint_path)
-                                            
-                                            # Update UI
                                             with self.output:
-                                                print(f"🎉 [{timestamp}] New checkpoint detected: {checkpoint_path}")
+                                                print(f"✅ [Pattern {i+1}] Found checkpoint pattern in log line: {line}")
+                                                print(f"📁 Extracted checkpoint folder: {checkpoint_path}")
                                             
-                                            # Refresh checkpoints dropdown
-                                            self.update_checkpoints_dropdown()
-                                        else:
-                                            with self.output:
-                                                print(f"🔄 [{timestamp}] Checkpoint already known: {checkpoint_path}")
+                                            # Avoid duplicate notifications for the same checkpoint
+                                            if checkpoint_path not in self.last_checkpoint_time:
+                                                self.last_checkpoint_time[checkpoint_path] = timestamp
+                                                
+                                                # Add to detected checkpoints for prioritized listing
+                                                self.detected_checkpoints.add(checkpoint_path)
+                                                
+                                                # Update UI
+                                                with self.output:
+                                                    print(f"🎉 [{timestamp}] New checkpoint folder detected: {checkpoint_path}")
+                                                
+                                                # Refresh checkpoints dropdown
+                                                self.update_checkpoints_dropdown()
+                                            else:
+                                                with self.output:
+                                                    print(f"🔄 [{timestamp}] Checkpoint folder already known: {checkpoint_path}")
                                         break
                             
                             # Log inspection summary every 30 seconds
@@ -668,7 +708,7 @@ class KServeDeployer:
                                 self._last_summary_time = current_time
                             elif (current_time - self._last_summary_time).seconds >= 30:
                                 with self.output:
-                                    print(f"📊 Log inspection summary: {lines_checked} lines checked, {len(self.detected_checkpoints)} total checkpoints found")
+                                    print(f"📊 Log inspection summary: {lines_checked} lines checked, {len(self.detected_checkpoints)} total checkpoint folders found")
                                 self._last_summary_time = current_time
                                         
                         except client.ApiException as e:
