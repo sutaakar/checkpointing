@@ -59,6 +59,12 @@ class KServeDeployer:
             description='PyTorchJob:',
             style={'description_width': 'initial'}
         )
+        self.refresh_jobs_button = widgets.Button(
+            description='Refresh Jobs',
+            button_style='info',
+            icon='refresh',
+            layout=widgets.Layout(width='120px')
+        )
         self.monitor_logs_checkbox = widgets.Checkbox(
             value=False,
             description='Monitor PyTorchJob logs for new checkpoints',
@@ -85,8 +91,9 @@ class KServeDeployer:
         )
         self.output = widgets.Output()
         
-        # Link button to its function
+        # Link buttons to their functions
         self.create_button.on_click(self._create_inference_service)
+        self.refresh_jobs_button.on_click(self._refresh_jobs_button_click)
         
         # Link checkbox to enable/disable log monitoring
         self.monitor_logs_checkbox.observe(self._on_monitor_logs_change, names='value')
@@ -94,12 +101,22 @@ class KServeDeployer:
         # Link namespace dropdown to update PyTorchJob list
         self.namespace_dropdown.observe(self._on_namespace_change, names='value')
         
+        # Link kubernetes credentials to refresh PyTorchJob list when filled
+        self.kube_api_server.observe(self._on_credentials_change, names='value')
+        self.kube_token.observe(self._on_credentials_change, names='value')
+        
+        # Create HBox for PyTorchJob dropdown and refresh button
+        self.pytorchjob_row = widgets.HBox([
+            self.pytorchjob_dropdown,
+            self.refresh_jobs_button
+        ])
+        
         # The VBox holds all our UI elements
         self.ui = widgets.VBox([
             self.kube_api_server, 
             self.kube_token, 
             self.namespace_dropdown,
-            self.pytorchjob_dropdown,
+            self.pytorchjob_row,
             self.monitor_logs_checkbox,
             self.log_status,
             self.checkpoints_dropdown, 
@@ -154,11 +171,14 @@ class KServeDeployer:
         """Updates the PyTorchJob dropdown with available jobs in the selected namespace."""
         try:
             # Get Kubernetes configuration
-            api_server_url = self.kube_api_server.value
-            api_token = self.kube_token.value
+            api_server_url = self.kube_api_server.value.strip()
+            api_token = self.kube_token.value.strip()
             
             if not api_server_url or not api_token:
                 self.pytorchjob_dropdown.options = []
+                if hasattr(self, 'output'):  # Check if output widget exists
+                    with self.output:
+                        print("Please provide Kubernetes API server URL and token to load PyTorchJobs")
                 return
                 
             # Configure Kubernetes client
@@ -193,13 +213,48 @@ class KServeDeployer:
                     
             self.pytorchjob_dropdown.options = job_names
             
+            # Provide user feedback
+            if hasattr(self, 'output'):
+                with self.output:
+                    if job_names:
+                        print(f"Found {len(job_names)} PyTorchJob(s) in namespace '{self._get_selected_namespace()}'")
+                    else:
+                        print(f"No PyTorchJobs found in namespace '{self._get_selected_namespace()}'")
+                        print("Make sure PyTorchJobs exist and you have the correct permissions")
+            
+        except client.ApiException as e:
+            self.pytorchjob_dropdown.options = []
+            with self.output:
+                if e.status == 401:
+                    print("Authentication failed: Please check your Kubernetes token")
+                elif e.status == 403:
+                    print("Access denied: You don't have permission to list PyTorchJobs in this namespace")
+                elif e.status == 404:
+                    print("PyTorchJob resource not found: Training Operator may not be installed")
+                else:
+                    print(f"Kubernetes API error ({e.status}): {e.reason}")
         except Exception as e:
             self.pytorchjob_dropdown.options = []
             with self.output:
-                print(f"Error fetching PyTorchJobs: {e}")
+                if "connection" in str(e).lower():
+                    print("Connection failed: Please check your Kubernetes API server URL")
+                else:
+                    print(f"Error fetching PyTorchJobs: {e}")
     
     def _on_namespace_change(self, change):
         """Handles namespace dropdown changes."""
+        self._update_pytorchjob_dropdown()
+        
+    def _on_credentials_change(self, change):
+        """Handles kubernetes credentials changes."""
+        # Only refresh if both credentials are provided
+        if self.kube_api_server.value.strip() and self.kube_token.value.strip():
+            self._update_pytorchjob_dropdown()
+    
+    def _refresh_jobs_button_click(self, button):
+        """Handles refresh jobs button click."""
+        with self.output:
+            print("Refreshing PyTorchJob list...")
         self._update_pytorchjob_dropdown()
         
     def _on_monitor_logs_change(self, change):
