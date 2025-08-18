@@ -1,7 +1,11 @@
 import ipywidgets as widgets
 from IPython.display import display
 import os
-from kubernetes import client, config
+import threading
+import time
+import re
+from datetime import datetime
+from kubernetes import client, config, watch
 
 class KServeDeployer:
     """A ready-to-use Jupyter widget for deploying KServe InferenceServices."""
@@ -9,9 +13,13 @@ class KServeDeployer:
     def __init__(self, checkpoint_dir='/opt/app-root/src/shared'):
         self.checkpoint_dir = checkpoint_dir
         self.current_namespace = self._detect_current_namespace()
+        self.log_monitor_thread = None
+        self.stop_monitoring = False
+        self.last_checkpoint_time = {}
         self._build_ui()
         self.update_checkpoints_dropdown()
         self._update_namespace_dropdown()
+        self._update_pytorchjob_dropdown()
         
     def _detect_current_namespace(self):
         """Detects the current namespace from the service account token file."""
@@ -46,6 +54,21 @@ class KServeDeployer:
             description='Namespace:',
             style={'description_width': 'initial'}
         )
+        self.pytorchjob_dropdown = widgets.Dropdown(
+            options=[],
+            description='PyTorchJob:',
+            style={'description_width': 'initial'}
+        )
+        self.monitor_logs_checkbox = widgets.Checkbox(
+            value=False,
+            description='Monitor PyTorchJob logs for new checkpoints',
+            style={'description_width': 'initial'},
+            layout={'width': 'max-content'}
+        )
+        self.log_status = widgets.HTML(
+            value='<i>Log monitoring: Inactive</i>',
+            style={'description_width': 'initial'}
+        )
         self.checkpoints_dropdown = widgets.Dropdown(
             options=[],
             description='Checkpoints:',
@@ -65,11 +88,20 @@ class KServeDeployer:
         # Link button to its function
         self.create_button.on_click(self._create_inference_service)
         
+        # Link checkbox to enable/disable log monitoring
+        self.monitor_logs_checkbox.observe(self._on_monitor_logs_change, names='value')
+        
+        # Link namespace dropdown to update PyTorchJob list
+        self.namespace_dropdown.observe(self._on_namespace_change, names='value')
+        
         # The VBox holds all our UI elements
         self.ui = widgets.VBox([
             self.kube_api_server, 
             self.kube_token, 
             self.namespace_dropdown,
+            self.pytorchjob_dropdown,
+            self.monitor_logs_checkbox,
+            self.log_status,
             self.checkpoints_dropdown, 
             self.inference_service_name, 
             self.create_button, 
@@ -117,6 +149,186 @@ class KServeDeployer:
     def _get_selected_namespace(self):
         """Returns the currently selected namespace."""
         return self.namespace_dropdown.value
+    
+    def _update_pytorchjob_dropdown(self):
+        """Updates the PyTorchJob dropdown with available jobs in the selected namespace."""
+        try:
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value
+            api_token = self.kube_token.value
+            
+            if not api_server_url or not api_token:
+                self.pytorchjob_dropdown.options = []
+                return
+                
+            # Configure Kubernetes client
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            api = client.CustomObjectsApi(api_client)
+            
+            # Get PyTorchJobs from the selected namespace
+            namespace = self._get_selected_namespace()
+            pytorchjobs = api.list_namespaced_custom_object(
+                group='kubeflow.org',
+                version='v1',
+                namespace=namespace,
+                plural='pytorchjobs'
+            )
+            
+            job_names = []
+            for job in pytorchjobs.get('items', []):
+                job_name = job['metadata']['name']
+                status = job.get('status', {}).get('conditions', [])
+                # Add status indicator
+                if any(c.get('type') == 'Running' and c.get('status') == 'True' for c in status):
+                    job_names.append(f"{job_name} (Running)")
+                elif any(c.get('type') == 'Succeeded' and c.get('status') == 'True' for c in status):
+                    job_names.append(f"{job_name} (Completed)")
+                else:
+                    job_names.append(f"{job_name} (Other)")
+                    
+            self.pytorchjob_dropdown.options = job_names
+            
+        except Exception as e:
+            self.pytorchjob_dropdown.options = []
+            with self.output:
+                print(f"Error fetching PyTorchJobs: {e}")
+    
+    def _on_namespace_change(self, change):
+        """Handles namespace dropdown changes."""
+        self._update_pytorchjob_dropdown()
+        
+    def _on_monitor_logs_change(self, change):
+        """Handles log monitoring checkbox changes."""
+        if change['new']:  # Start monitoring
+            self._start_log_monitoring()
+        else:  # Stop monitoring
+            self._stop_log_monitoring()
+    
+    def _start_log_monitoring(self):
+        """Starts background log monitoring for the selected PyTorchJob."""
+        if self.log_monitor_thread and self.log_monitor_thread.is_alive():
+            return  # Already monitoring
+            
+        selected_job = self.pytorchjob_dropdown.value
+        if not selected_job:
+            with self.output:
+                print("Please select a PyTorchJob to monitor")
+            self.monitor_logs_checkbox.value = False
+            return
+            
+        # Extract job name (remove status indicator)
+        job_name = selected_job.split(' (')[0]
+        
+        self.stop_monitoring = False
+        self.log_monitor_thread = threading.Thread(
+            target=self._monitor_logs_worker,
+            args=(job_name,),
+            daemon=True
+        )
+        self.log_monitor_thread.start()
+        
+        self.log_status.value = f'<span style="color: green;">Log monitoring: Active for {job_name}</span>'
+        with self.output:
+            print(f"Started monitoring logs for PyTorchJob: {job_name}")
+    
+    def _stop_log_monitoring(self):
+        """Stops background log monitoring."""
+        self.stop_monitoring = True
+        self.log_status.value = '<i>Log monitoring: Inactive</i>'
+        with self.output:
+            print("Stopped log monitoring")
+    
+    def _monitor_logs_worker(self, job_name):
+        """Background worker that monitors PyTorchJob logs for checkpoint events."""
+        try:
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value
+            api_token = self.kube_token.value
+            namespace = self._get_selected_namespace()
+            
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            v1 = client.CoreV1Api(api_client)
+            
+            # Checkpoint detection patterns
+            checkpoint_patterns = [
+                r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin))',
+                r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin))',
+                r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin))',
+                r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin))',
+                r'saving.*?model.*?(\S+\.(?:ckpt|pt|pth|bin))'
+            ]
+            
+            # Get pods associated with the PyTorchJob
+            pod_label_selector = f"job-name={job_name}"
+            
+            while not self.stop_monitoring:
+                try:
+                    pods = v1.list_namespaced_pod(
+                        namespace=namespace,
+                        label_selector=pod_label_selector
+                    )
+                    
+                    for pod in pods.items:
+                        if self.stop_monitoring:
+                            break
+                            
+                        pod_name = pod.metadata.name
+                        
+                        try:
+                            # Get recent logs
+                            logs = v1.read_namespaced_pod_log(
+                                name=pod_name,
+                                namespace=namespace,
+                                since_seconds=30,  # Last 30 seconds
+                                timestamps=True
+                            )
+                            
+                            # Check for checkpoint patterns
+                            for line in logs.split('\n'):
+                                if self.stop_monitoring:
+                                    break
+                                    
+                                for pattern in checkpoint_patterns:
+                                    match = re.search(pattern, line, re.IGNORECASE)
+                                    if match:
+                                        checkpoint_path = match.group(1)
+                                        timestamp = datetime.now().strftime("%H:%M:%S")
+                                        
+                                        # Update UI
+                                        with self.output:
+                                            print(f"[{timestamp}] New checkpoint detected: {checkpoint_path}")
+                                        
+                                        # Refresh checkpoints dropdown
+                                        self.update_checkpoints_dropdown()
+                                        break
+                                        
+                        except client.ApiException:
+                            # Pod might not be ready yet or logs not available
+                            pass
+                            
+                    time.sleep(5)  # Check every 5 seconds
+                    
+                except Exception as e:
+                    with self.output:
+                        print(f"Error in log monitoring: {e}")
+                    time.sleep(10)  # Wait longer on error
+                    
+        except Exception as e:
+            with self.output:
+                print(f"Fatal error in log monitoring: {e}")
+        finally:
+            if not self.stop_monitoring:
+                self.log_status.value = '<span style="color: red;">Log monitoring: Error</span>'
 
     def _create_inference_service(self, b):
         """Creates an InferenceService object when the button is clicked."""
@@ -184,6 +396,10 @@ class KServeDeployer:
             with self.output:
                 self.output.clear_output()
                 print(f"An unexpected error occurred: {e}")
+    
+    def __del__(self):
+        """Cleanup when widget is destroyed."""
+        self._stop_log_monitoring()
     
     def _ipython_display_(self):
         """Allows the object to be displayed directly in a notebook."""
