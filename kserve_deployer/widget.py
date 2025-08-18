@@ -355,34 +355,82 @@ class KServeDeployer:
             api_client = client.ApiClient(configuration)
             v1 = client.CoreV1Api(api_client)
             
-            # Checkpoint detection patterns - handle both files and directories
+            with self.output:
+                print(f"🔍 Starting log monitoring for PyTorchJob '{job_name}' in namespace '{namespace}'")
+            
+            # Improved checkpoint detection patterns - handle both files and directories
             checkpoint_patterns = [
-                # Directory patterns (common in transformers/pytorch lightning)
-                r'saving.*?checkpoint.*?to\s+([/\w\-\.]+/checkpoint-\d+)',
-                r'saved.*?checkpoint.*?to\s+([/\w\-\.]+/checkpoint-\d+)', 
-                r'checkpoint.*?saved.*?to\s+([/\w\-\.]+)',
-                r'saving.*?model.*?to\s+([/\w\-\.]+)',
+                # Directory patterns (common in transformers/pytorch lightning) - Fixed regex
+                r'saving.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)',
+                r'saved.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)', 
+                r'checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
+                r'saving.*?model.*?to\s+([/\w\-\./]+)',
+                # More comprehensive model checkpoint patterns
+                r'saving model checkpoint to\s+([/\w\-\./]+)',
+                r'model.*?checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
                 # File patterns (traditional checkpoints)
                 r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
                 r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
                 r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
                 r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
                 # Generic patterns
-                r'saving.*?(?:checkpoint|model).*?([/\w\-\.]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)',
-                r'saved.*?(?:checkpoint|model).*?([/\w\-\.]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)'
+                r'saving.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)',
+                r'saved.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)'
             ]
             
-            # Get pods associated with the PyTorchJob
-            pod_label_selector = f"job-name={job_name}"
+            # Get pods associated with the PyTorchJob - Try multiple label selectors
+            possible_selectors = [
+                f"job-name={job_name}",
+                f"pytorch-job-name={job_name}",
+                f"training.kubeflow.org/job-name={job_name}",
+                f"pytorch.org/job-name={job_name}",
+                f"app.kubernetes.io/name={job_name}"
+            ]
+            
+            logs_inspected = False
+            pods_found = False
             
             while not self.stop_monitoring:
                 try:
-                    pods = v1.list_namespaced_pod(
-                        namespace=namespace,
-                        label_selector=pod_label_selector
-                    )
+                    # Try different label selectors to find pods
+                    all_pods = []
+                    working_selector = None
                     
-                    for pod in pods.items:
+                    for selector in possible_selectors:
+                        pods = v1.list_namespaced_pod(
+                            namespace=namespace,
+                            label_selector=selector
+                        )
+                        if pods.items:
+                            all_pods = pods.items
+                            working_selector = selector
+                            if not pods_found:
+                                with self.output:
+                                    print(f"📦 Found {len(pods.items)} pod(s) using label selector: {selector}")
+                                pods_found = True
+                            break
+                    
+                    if not all_pods and not pods_found:
+                        # Try to find pods without label selector, matching by name pattern
+                        all_pods_in_ns = v1.list_namespaced_pod(namespace=namespace)
+                        for pod in all_pods_in_ns.items:
+                            if job_name in pod.metadata.name:
+                                all_pods.append(pod)
+                        
+                        if all_pods:
+                            with self.output:
+                                print(f"📦 Found {len(all_pods)} pod(s) by name pattern matching")
+                            pods_found = True
+                    
+                    if not all_pods:
+                        if not pods_found:
+                            with self.output:
+                                print(f"⚠️  No pods found for PyTorchJob '{job_name}'. Tried selectors: {possible_selectors}")
+                            pods_found = True  # Avoid repeated messages
+                        time.sleep(10)
+                        continue
+                    
+                    for pod in all_pods:
                         if self.stop_monitoring:
                             break
                             
@@ -393,20 +441,35 @@ class KServeDeployer:
                             logs = v1.read_namespaced_pod_log(
                                 name=pod_name,
                                 namespace=namespace,
-                                since_seconds=30,  # Last 30 seconds
+                                since_seconds=60,  # Increased to 60 seconds to catch more logs
                                 timestamps=True
                             )
                             
+                            if not logs_inspected:
+                                with self.output:
+                                    print(f"📋 Inspecting logs from pod '{pod_name}'...")
+                                    logs_inspected = True
+                            
                             # Check for checkpoint patterns
+                            lines_checked = 0
                             for line in logs.split('\n'):
                                 if self.stop_monitoring:
                                     break
+                                
+                                lines_checked += 1
+                                line = line.strip()
+                                if not line:
+                                    continue
                                     
-                                for pattern in checkpoint_patterns:
+                                for i, pattern in enumerate(checkpoint_patterns):
                                     match = re.search(pattern, line, re.IGNORECASE)
                                     if match:
                                         checkpoint_path = match.group(1)
                                         timestamp = datetime.now().strftime("%H:%M:%S")
+                                        
+                                        with self.output:
+                                            print(f"✅ [Pattern {i+1}] Found checkpoint pattern in log line: {line}")
+                                            print(f"📁 Extracted checkpoint path: {checkpoint_path}")
                                         
                                         # Avoid duplicate notifications for the same checkpoint
                                         if checkpoint_path not in self.last_checkpoint_time:
@@ -417,26 +480,44 @@ class KServeDeployer:
                                             
                                             # Update UI
                                             with self.output:
-                                                print(f"[{timestamp}] New checkpoint detected: {checkpoint_path}")
+                                                print(f"🎉 [{timestamp}] New checkpoint detected: {checkpoint_path}")
                                             
                                             # Refresh checkpoints dropdown
                                             self.update_checkpoints_dropdown()
+                                        else:
+                                            with self.output:
+                                                print(f"🔄 [{timestamp}] Checkpoint already known: {checkpoint_path}")
                                         break
+                            
+                            # Log inspection summary every 30 seconds
+                            current_time = datetime.now()
+                            if not hasattr(self, '_last_summary_time'):
+                                self._last_summary_time = current_time
+                            elif (current_time - self._last_summary_time).seconds >= 30:
+                                with self.output:
+                                    print(f"📊 Log inspection summary: {lines_checked} lines checked, {len(self.detected_checkpoints)} total checkpoints found")
+                                self._last_summary_time = current_time
                                         
-                        except client.ApiException:
+                        except client.ApiException as e:
                             # Pod might not be ready yet or logs not available
+                            if e.status == 400:
+                                with self.output:
+                                    print(f"⚠️  Pod '{pod_name}' logs not available yet (container may be starting)")
                             pass
+                        except Exception as e:
+                            with self.output:
+                                print(f"❌ Error reading logs from pod '{pod_name}': {e}")
                             
                     time.sleep(5)  # Check every 5 seconds
                     
                 except Exception as e:
                     with self.output:
-                        print(f"Error in log monitoring: {e}")
+                        print(f"❌ Error in log monitoring: {e}")
                     time.sleep(10)  # Wait longer on error
                     
         except Exception as e:
             with self.output:
-                print(f"Fatal error in log monitoring: {e}")
+                print(f"💥 Fatal error in log monitoring: {e}")
         finally:
             if not self.stop_monitoring:
                 self.log_status.value = '<span style="color: red;">Log monitoring: Error</span>'
