@@ -47,7 +47,7 @@ class KServeDeployer:
         self.update_checkpoints_dropdown()
         self._update_namespace_dropdown()
         self._update_pytorchjob_dropdown()
-        self._update_inferenceservice_dropdown()
+        self._update_inferenceservice_dropdown(preserve_selection=False)
         
     def _detect_current_namespace(self):
         """Detects the current namespace from environment variables."""
@@ -118,7 +118,7 @@ class KServeDeployer:
         )
         self.inference_service_name = widgets.Text(
             value='my-inference-service',
-            placeholder='Enter a name for the InferenceService',
+            placeholder='Auto-generated from checkpoint folder',
             description='Service Name:',
             style={'description_width': 'initial'}
         )
@@ -187,8 +187,9 @@ class KServeDeployer:
         self.kube_api_server.observe(self._on_credentials_change, names='value')
         self.kube_token.observe(self._on_credentials_change, names='value')
         
-        # Link dropdowns to update storage URI preview
+        # Link dropdowns to update storage URI preview and service name
         self.checkpoints_dropdown.observe(self._update_storage_uri_preview, names='value')
+        self.checkpoints_dropdown.observe(self._update_service_name_from_checkpoint, names='value')
         self.pytorchjob_dropdown.observe(self._update_storage_uri_preview, names='value')
         
         # Link InferenceService dropdown to update status
@@ -228,6 +229,49 @@ class KServeDeployer:
             self.service_status_info,
             self.output
         ])
+
+    def _sanitize_kubernetes_name(self, name):
+        """Sanitizes a name to comply with Kubernetes naming conventions.
+        
+        Kubernetes names must:
+        - Contain only lowercase alphanumeric characters or hyphens
+        - Start and end with an alphanumeric character
+        - Be no more than 253 characters (we'll limit to 63 for service names)
+        """
+        import re
+        
+        if not name:
+            return "inference-service"
+        
+        # Extract just the folder name from path
+        folder_name = name.split('/')[-1] if '/' in name else name
+        
+        # Convert to lowercase
+        sanitized = folder_name.lower()
+        
+        # Replace invalid characters with hyphens
+        sanitized = re.sub(r'[^a-z0-9\-]', '-', sanitized)
+        
+        # Remove multiple consecutive hyphens
+        sanitized = re.sub(r'-+', '-', sanitized)
+        
+        # Ensure it starts and ends with alphanumeric character
+        sanitized = re.sub(r'^[^a-z0-9]+', '', sanitized)
+        sanitized = re.sub(r'[^a-z0-9]+$', '', sanitized)
+        
+        # Ensure it's not empty after sanitization
+        if not sanitized:
+            sanitized = "inference-service"
+        
+        # Limit length to 63 characters (Kubernetes service name limit)
+        if len(sanitized) > 63:
+            sanitized = sanitized[:60] + "svc"  # Keep some indication it was truncated
+        
+        # Add prefix if it doesn't start with alphanumeric
+        if not sanitized[0].isalnum():
+            sanitized = "svc-" + sanitized[1:]
+        
+        return sanitized
 
     def _extract_checkpoint_directory(self, matched_path, pattern_index):
         """Extracts checkpoint directory from matched path, handling both files and directories."""
@@ -303,8 +347,9 @@ class KServeDeployer:
                 if self.path_mapping:
                     print(f"\n📍 Applied path mapping: {self.path_mapping}")
                 
-                # Update storage URI preview
+                # Update storage URI preview and service name
                 self._update_storage_uri_preview()
+                self._update_service_name_from_checkpoint()
                 
     def _update_namespace_dropdown(self):
         """Updates the namespace dropdown with common namespaces."""
@@ -402,14 +447,14 @@ class KServeDeployer:
     def _on_namespace_change(self, change):
         """Handles namespace dropdown changes."""
         self._update_pytorchjob_dropdown()
-        self._update_inferenceservice_dropdown()
+        self._update_inferenceservice_dropdown(preserve_selection=False)
         
     def _on_credentials_change(self, change):
         """Handles kubernetes credentials changes."""
         # Only refresh if both credentials are provided
         if self.kube_api_server.value.strip() and self.kube_token.value.strip():
             self._update_pytorchjob_dropdown()
-            self._update_inferenceservice_dropdown()
+            self._update_inferenceservice_dropdown(preserve_selection=False)
     
     def _refresh_jobs_button_click(self, button):
         """Handles refresh jobs button click."""
@@ -500,6 +545,29 @@ class KServeDeployer:
             with self.output:
                 print(f"❌ Error deleting InferenceService: {e}")
     
+    def _update_service_name_from_checkpoint(self, change=None):
+        """Updates the InferenceService name based on the selected checkpoint folder."""
+        try:
+            checkpoint_path = self.checkpoints_dropdown.value
+            
+            if not checkpoint_path:
+                # Reset to default if no checkpoint selected
+                self.inference_service_name.value = 'my-inference-service'
+                return
+            
+            # Generate sanitized service name from checkpoint path
+            sanitized_name = self._sanitize_kubernetes_name(checkpoint_path)
+            
+            # Update the service name field
+            self.inference_service_name.value = sanitized_name
+            
+            with self.output:
+                print(f"📝 Auto-generated service name: '{sanitized_name}'")
+                
+        except Exception as e:
+            with self.output:
+                print(f"❌ Error generating service name: {e}")
+    
     def _update_storage_uri_preview(self, change=None):
         """Updates the storage URI preview based on current selections."""
         try:
@@ -554,9 +622,16 @@ class KServeDeployer:
         except Exception as e:
             self.storage_uri_info.value = f'<i>Error generating preview: {e}</i>'
     
-    def _update_inferenceservice_dropdown(self):
+    def _update_inferenceservice_dropdown(self, preserve_selection=True):
         """Updates the InferenceService dropdown with available services in the selected namespace."""
         try:
+            # Store current selection to preserve it if requested
+            current_selection = None
+            current_service_name = None
+            if preserve_selection and self.inferenceservice_dropdown.value:
+                current_selection = self.inferenceservice_dropdown.value
+                current_service_name = current_selection.split(' (')[0]
+            
             # Get Kubernetes configuration
             api_server_url = self.kube_api_server.value.strip()
             api_token = self.kube_token.value.strip()
@@ -584,6 +659,9 @@ class KServeDeployer:
             )
             
             service_names = []
+            found_current_service = False
+            new_selection = None
+            
             for service in inference_services.get('items', []):
                 service_name = service['metadata']['name']
                 
@@ -601,9 +679,28 @@ class KServeDeployer:
                             ready_status = 'Not Ready'
                         break
                 
-                service_names.append(f"{service_name} ({ready_status})")
+                service_display_name = f"{service_name} ({ready_status})"
+                service_names.append(service_display_name)
+                
+                # Check if this is the currently selected service
+                if preserve_selection and current_service_name == service_name:
+                    found_current_service = True
+                    new_selection = service_display_name
                     
             self.inferenceservice_dropdown.options = service_names
+            
+            # Restore selection if the service still exists
+            if preserve_selection and found_current_service and new_selection:
+                self.inferenceservice_dropdown.value = new_selection
+            elif preserve_selection and current_selection and not found_current_service:
+                # Service was deleted - stop watching and clear selection
+                if self.watch_service_checkbox.value:
+                    with self.output:
+                        print(f"🗑️  Watched service '{current_service_name}' was deleted, stopping watch...")
+                    self.watch_service_checkbox.value = False
+                # Clear selection since service no longer exists
+                if service_names:
+                    self.inferenceservice_dropdown.value = service_names[0]
             
             # Update status for currently selected service
             if service_names and hasattr(self, 'service_status_info'):
@@ -911,7 +1008,7 @@ class KServeDeployer:
                         if event_type == 'DELETED':
                             with self.output:
                                 print(f"🗑️  InferenceService '{service_name}' was deleted")
-                            # Refresh the dropdown
+                            # Refresh the dropdown - this will handle stopping the watch
                             self._update_inferenceservice_dropdown()
                             # Stop watching as the service no longer exists
                             self.stop_service_watching = True
@@ -1425,6 +1522,14 @@ class KServeDeployer:
             
             # Refresh the InferenceService list to show the new service
             self._update_inferenceservice_dropdown()
+            
+            # Auto-select the newly created service if it exists
+            for option in self.inferenceservice_dropdown.options:
+                if option.startswith(f"{service_name} ("):
+                    self.inferenceservice_dropdown.value = option
+                    with self.output:
+                        print(f"✅ Auto-selected newly created service: {service_name}")
+                    break
 
         except client.ApiException as e:
             with self.output:
