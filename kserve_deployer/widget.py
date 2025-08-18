@@ -45,6 +45,7 @@ class KServeDeployer:
         self.update_checkpoints_dropdown()
         self._update_namespace_dropdown()
         self._update_pytorchjob_dropdown()
+        self._update_inferenceservice_dropdown()
         
     def _detect_current_namespace(self):
         """Detects the current namespace from environment variables."""
@@ -123,6 +124,30 @@ class KServeDeployer:
             value='<i>Storage URI will be shown here once checkpoint is selected</i>',
             style={'description_width': 'initial'}
         )
+        
+        # InferenceService management section
+        self.inferenceservice_dropdown = widgets.Dropdown(
+            options=[],
+            description='InferenceServices:',
+            style={'description_width': 'initial'}
+        )
+        self.refresh_services_button = widgets.Button(
+            description='Refresh Services',
+            button_style='info',
+            icon='refresh',
+            layout=widgets.Layout(width='140px')
+        )
+        self.delete_service_button = widgets.Button(
+            description='Delete Service',
+            button_style='danger',
+            icon='trash',
+            layout=widgets.Layout(width='130px')
+        )
+        self.service_status_info = widgets.HTML(
+            value='<i>Select an InferenceService to see its status</i>',
+            style={'description_width': 'initial'}
+        )
+        
         self.create_button = widgets.Button(
             description='Create InferenceService',
             button_style='success',
@@ -134,6 +159,8 @@ class KServeDeployer:
         self.create_button.on_click(self._create_inference_service)
         self.refresh_jobs_button.on_click(self._refresh_jobs_button_click)
         self.scan_checkpoints_button.on_click(self._scan_checkpoints_button_click)
+        self.refresh_services_button.on_click(self._refresh_services_button_click)
+        self.delete_service_button.on_click(self._delete_service_button_click)
         
         # Link checkbox to enable/disable log monitoring
         self.monitor_logs_checkbox.observe(self._on_monitor_logs_change, names='value')
@@ -149,11 +176,21 @@ class KServeDeployer:
         self.checkpoints_dropdown.observe(self._update_storage_uri_preview, names='value')
         self.pytorchjob_dropdown.observe(self._update_storage_uri_preview, names='value')
         
+        # Link InferenceService dropdown to update status
+        self.inferenceservice_dropdown.observe(self._update_service_status, names='value')
+        
         # Create HBox for PyTorchJob dropdown and buttons
         self.pytorchjob_row = widgets.HBox([
             self.pytorchjob_dropdown,
             self.refresh_jobs_button,
             self.scan_checkpoints_button
+        ])
+        
+        # Create HBox for InferenceService dropdown and buttons
+        self.inferenceservice_row = widgets.HBox([
+            self.inferenceservice_dropdown,
+            self.refresh_services_button,
+            self.delete_service_button
         ])
         
         # The VBox holds all our UI elements
@@ -167,7 +204,10 @@ class KServeDeployer:
             self.checkpoints_dropdown, 
             self.inference_service_name,
             self.storage_uri_info,
-            self.create_button, 
+            self.create_button,
+            widgets.HTML('<hr style="margin: 20px 0;"><h3>📊 InferenceService Management</h3>'),
+            self.inferenceservice_row,
+            self.service_status_info,
             self.output
         ])
 
@@ -344,12 +384,14 @@ class KServeDeployer:
     def _on_namespace_change(self, change):
         """Handles namespace dropdown changes."""
         self._update_pytorchjob_dropdown()
+        self._update_inferenceservice_dropdown()
         
     def _on_credentials_change(self, change):
         """Handles kubernetes credentials changes."""
         # Only refresh if both credentials are provided
         if self.kube_api_server.value.strip() and self.kube_token.value.strip():
             self._update_pytorchjob_dropdown()
+            self._update_inferenceservice_dropdown()
     
     def _refresh_jobs_button_click(self, button):
         """Handles refresh jobs button click."""
@@ -372,6 +414,73 @@ class KServeDeployer:
             print(f"🔍 Manually scanning PyTorchJob '{job_name}' for checkpoint folders...")
         
         self._scan_job_for_checkpoints(job_name)
+    
+    def _refresh_services_button_click(self, button):
+        """Handles refresh services button click."""
+        with self.output:
+            print("Refreshing InferenceService list...")
+        self._update_inferenceservice_dropdown()
+    
+    def _delete_service_button_click(self, button):
+        """Handles delete service button click."""
+        selected_service = self.inferenceservice_dropdown.value
+        if not selected_service:
+            with self.output:
+                print("⚠️  Please select an InferenceService to delete")
+            return
+            
+        service_name = selected_service.split(' (')[0]
+        
+        # Confirm deletion
+        try:
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value.strip()
+            api_token = self.kube_token.value.strip()
+            
+            if not api_server_url or not api_token:
+                with self.output:
+                    print("❌ Kubernetes credentials required for deletion")
+                return
+                
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            api = client.CustomObjectsApi(api_client)
+            
+            # Delete the InferenceService
+            namespace = self._get_selected_namespace()
+            with self.output:
+                print(f"🗑️  Deleting InferenceService '{service_name}' in namespace '{namespace}'...")
+            
+            api.delete_namespaced_custom_object(
+                group='serving.kserve.io',
+                version='v1beta1',
+                namespace=namespace,
+                plural='inferenceservices',
+                name=service_name
+            )
+            
+            with self.output:
+                print(f"✅ InferenceService '{service_name}' deleted successfully!")
+                print("🔄 Refreshing service list...")
+            
+            # Refresh the list
+            self._update_inferenceservice_dropdown()
+            
+        except client.ApiException as e:
+            with self.output:
+                if e.status == 404:
+                    print(f"❌ InferenceService '{service_name}' not found (may have been already deleted)")
+                elif e.status == 403:
+                    print(f"❌ Access denied: You don't have permission to delete InferenceService '{service_name}'")
+                else:
+                    print(f"❌ Kubernetes API Error: {e.reason}")
+        except Exception as e:
+            with self.output:
+                print(f"❌ Error deleting InferenceService: {e}")
     
     def _update_storage_uri_preview(self, change=None):
         """Updates the storage URI preview based on current selections."""
@@ -426,6 +535,162 @@ class KServeDeployer:
             
         except Exception as e:
             self.storage_uri_info.value = f'<i>Error generating preview: {e}</i>'
+    
+    def _update_inferenceservice_dropdown(self):
+        """Updates the InferenceService dropdown with available services in the selected namespace."""
+        try:
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value.strip()
+            api_token = self.kube_token.value.strip()
+            
+            if not api_server_url or not api_token:
+                self.inferenceservice_dropdown.options = []
+                return
+                
+            # Configure Kubernetes client
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            api = client.CustomObjectsApi(api_client)
+            
+            # Get InferenceServices from the selected namespace
+            namespace = self._get_selected_namespace()
+            inference_services = api.list_namespaced_custom_object(
+                group='serving.kserve.io',
+                version='v1beta1',
+                namespace=namespace,
+                plural='inferenceservices'
+            )
+            
+            service_names = []
+            for service in inference_services.get('items', []):
+                service_name = service['metadata']['name']
+                
+                # Get status
+                status = service.get('status', {})
+                conditions = status.get('conditions', [])
+                
+                # Determine overall status
+                ready_status = 'Unknown'
+                for condition in conditions:
+                    if condition.get('type') == 'Ready':
+                        if condition.get('status') == 'True':
+                            ready_status = 'Ready'
+                        elif condition.get('status') == 'False':
+                            ready_status = 'Not Ready'
+                        break
+                
+                service_names.append(f"{service_name} ({ready_status})")
+                    
+            self.inferenceservice_dropdown.options = service_names
+            
+            # Update status for currently selected service
+            if service_names and hasattr(self, 'service_status_info'):
+                self._update_service_status()
+            
+        except client.ApiException as e:
+            self.inferenceservice_dropdown.options = []
+            if hasattr(self, 'output'):
+                with self.output:
+                    if e.status == 401:
+                        print("Authentication failed: Please check your Kubernetes token")
+                    elif e.status == 403:
+                        print("Access denied: You don't have permission to list InferenceServices")
+                    elif e.status == 404:
+                        print("InferenceService resource not found: KServe may not be installed")
+        except Exception as e:
+            self.inferenceservice_dropdown.options = []
+            if hasattr(self, 'output'):
+                with self.output:
+                    print(f"Error fetching InferenceServices: {e}")
+    
+    def _update_service_status(self, change=None):
+        """Updates the service status display for the selected InferenceService."""
+        try:
+            selected_service = self.inferenceservice_dropdown.value
+            if not selected_service:
+                self.service_status_info.value = '<i>Select an InferenceService to see its status</i>'
+                return
+            
+            service_name = selected_service.split(' (')[0]
+            
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value.strip()
+            api_token = self.kube_token.value.strip()
+            
+            if not api_server_url or not api_token:
+                self.service_status_info.value = '<i>Kubernetes credentials required for status</i>'
+                return
+                
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            api = client.CustomObjectsApi(api_client)
+            
+            # Get specific InferenceService
+            namespace = self._get_selected_namespace()
+            service = api.get_namespaced_custom_object(
+                group='serving.kserve.io',
+                version='v1beta1',
+                namespace=namespace,
+                plural='inferenceservices',
+                name=service_name
+            )
+            
+            # Parse status information
+            status = service.get('status', {})
+            conditions = status.get('conditions', [])
+            url = status.get('url', 'Not available')
+            
+            # Build status display
+            status_html = f'''
+            <div style="background-color: #f8f9fa; padding: 12px; border-radius: 6px; margin: 4px 0;">
+                <strong>📊 Status for {service_name}:</strong><br/>
+                <strong>🔗 URL:</strong> <code>{url}</code><br/>
+                <strong>📋 Conditions:</strong><br/>
+            '''
+            
+            for condition in conditions:
+                condition_type = condition.get('type', 'Unknown')
+                condition_status = condition.get('status', 'Unknown')
+                reason = condition.get('reason', '')
+                message = condition.get('message', '')
+                
+                if condition_status == 'True':
+                    icon = '✅'
+                    color = 'green'
+                elif condition_status == 'False':
+                    icon = '❌'
+                    color = 'red'
+                else:
+                    icon = '⚠️'
+                    color = 'orange'
+                
+                status_html += f'''
+                <div style="margin-left: 15px; color: {color};">
+                    {icon} <strong>{condition_type}:</strong> {condition_status}
+                '''
+                
+                if reason:
+                    status_html += f'<br/>&nbsp;&nbsp;&nbsp;&nbsp;<small><i>Reason: {reason}</i></small>'
+                if message:
+                    status_html += f'<br/>&nbsp;&nbsp;&nbsp;&nbsp;<small><i>{message}</i></small>'
+                    
+                status_html += '</div>'
+            
+            status_html += '</div>'
+            self.service_status_info.value = status_html
+            
+        except client.ApiException as e:
+            self.service_status_info.value = f'<i>Error getting service status: {e.reason}</i>'
+        except Exception as e:
+            self.service_status_info.value = f'<i>Error: {e}</i>'
         
     def _on_monitor_logs_change(self, change):
         """Handles log monitoring checkbox changes."""
@@ -940,6 +1205,10 @@ class KServeDeployer:
                 print(f"🔗 Istio Sidecar: Enabled with HTTP prober rewriting")
                 print(f"🌐 Passthrough: Enabled for direct traffic routing")
                 print(f"🏠 Deployed to namespace: {namespace}")
+                print(f"🔄 Refreshing InferenceService list...")
+            
+            # Refresh the InferenceService list to show the new service
+            self._update_inferenceservice_dropdown()
 
         except client.ApiException as e:
             with self.output:
