@@ -42,7 +42,7 @@ class KServeDeployer:
         )
         self.namespace_dropdown = widgets.Dropdown(
             options=['default'],
-            value=self.current_namespace if self.current_namespace else 'default',
+            value='default',
             description='Namespace:',
             style={'description_width': 'initial'}
         )
@@ -123,9 +123,10 @@ class KServeDeployer:
         if self.current_namespace and self.current_namespace not in common_namespaces:
             common_namespaces.insert(0, self.current_namespace)
             
+        # Update the dropdown options first
         self.namespace_dropdown.options = common_namespaces
         
-        # Set default value to current namespace
+        # Set default value to current namespace (it's now guaranteed to be in the options)
         if self.current_namespace:
             self.namespace_dropdown.value = self.current_namespace
     
