@@ -929,7 +929,9 @@ class KServeDeployer:
                 print(f"👁️  Starting to watch InferenceService '{service_name}' in namespace '{namespace}'")
             
             last_ready_status = None
+            last_full_status = None  # Track full status object for better change detection
             watch_timeout = 600  # 10 minutes timeout
+            watch_restart_count = 0
             
             while not self.stop_service_watching:
                 try:
@@ -959,6 +961,10 @@ class KServeDeployer:
                         status = service_obj.get('status', {})
                         conditions = status.get('conditions', [])
                         
+                        # Debug: Log all received events
+                        with self.output:
+                            print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Watch event: {event_type} for {service_name}")
+                        
                         # Find the Ready condition
                         ready_status = 'Unknown'
                         ready_reason = ''
@@ -971,8 +977,19 @@ class KServeDeployer:
                                 ready_message = condition.get('message', '')
                                 break
                         
-                        # Check if status changed
-                        if ready_status != last_ready_status:
+                        # Check for any status changes (not just Ready condition)
+                        current_full_status = {
+                            'ready_status': ready_status,
+                            'ready_reason': ready_reason,
+                            'ready_message': ready_message,
+                            'url': status.get('url', ''),
+                            'conditions_count': len(conditions)
+                        }
+                        
+                        # Check if any status changed (more comprehensive than just ready_status)
+                        status_changed = (current_full_status != last_full_status) or (ready_status != last_ready_status)
+                        
+                        if status_changed:
                             timestamp = datetime.now().strftime("%H:%M:%S")
                             
                             with self.output:
@@ -983,17 +1000,20 @@ class KServeDeployer:
                                 if ready_message:
                                     print(f"   Message: {ready_message}")
                             
-                            # Special handling when service becomes ready
+                            # Always update the UI for any status change
+                            with self.output:
+                                print(f"🔄 Refreshing service information...")
+                            
+                            # Update the service status display
+                            self._update_service_status()
+                            
+                            # Refresh the dropdown to show updated status
+                            self._update_inferenceservice_dropdown()
+                            
+                            # Special celebration when service becomes ready
                             if ready_status == 'True' and last_ready_status != 'True':
                                 with self.output:
                                     print(f"🎉 [{timestamp}] InferenceService '{service_name}' is now READY!")
-                                    print(f"🔄 Refreshing service information...")
-                                
-                                # Update the service status display
-                                self._update_service_status()
-                                
-                                # Refresh the dropdown to show updated status
-                                self._update_inferenceservice_dropdown()
                                 
                                 # Get the service URL if available
                                 service_url = status.get('url', '')
@@ -1003,6 +1023,7 @@ class KServeDeployer:
                             
                             # Update last known status
                             last_ready_status = ready_status
+                            last_full_status = current_full_status
                             
                         # Handle deletion event
                         if event_type == 'DELETED':
@@ -1016,8 +1037,9 @@ class KServeDeployer:
                     
                     # If we reach here, the watch stream ended
                     if not self.stop_service_watching:
+                        watch_restart_count += 1
                         with self.output:
-                            print(f"🔄 Watch stream ended for '{service_name}', restarting...")
+                            print(f"🔄 Watch stream ended for '{service_name}', restarting... (restart #{watch_restart_count})")
                         time.sleep(5)  # Wait before restarting watch
                     
                 except client.ApiException as e:
@@ -1033,7 +1055,9 @@ class KServeDeployer:
                         continue
                     else:
                         with self.output:
-                            print(f"❌ API error watching '{service_name}': {e.reason}")
+                            print(f"❌ API error watching '{service_name}' (status {e.status}): {e.reason}")
+                            if hasattr(e, 'body') and e.body:
+                                print(f"   Error details: {e.body[:200]}...")  # First 200 chars
                         time.sleep(10)
                         continue
                 except Exception as e:
