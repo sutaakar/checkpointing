@@ -41,6 +41,8 @@ class KServeDeployer:
         self.stop_monitoring = False
         self.last_checkpoint_time = {}
         self.detected_checkpoints = set()  # Checkpoints found from logs
+        self.service_watch_thread = None
+        self.stop_service_watching = False
         self._build_ui()
         self.update_checkpoints_dropdown()
         self._update_namespace_dropdown()
@@ -147,6 +149,16 @@ class KServeDeployer:
             value='<i>Select an InferenceService to see its status</i>',
             style={'description_width': 'initial'}
         )
+        self.watch_service_checkbox = widgets.Checkbox(
+            value=False,
+            description='Watch selected InferenceService for status changes',
+            style={'description_width': 'initial'},
+            layout={'width': 'max-content'}
+        )
+        self.watch_status = widgets.HTML(
+            value='<i>InferenceService watching: Inactive</i>',
+            style={'description_width': 'initial'}
+        )
         
         self.create_button = widgets.Button(
             description='Create InferenceService',
@@ -165,6 +177,9 @@ class KServeDeployer:
         # Link checkbox to enable/disable log monitoring
         self.monitor_logs_checkbox.observe(self._on_monitor_logs_change, names='value')
         
+        # Link checkbox to enable/disable InferenceService watching
+        self.watch_service_checkbox.observe(self._on_watch_service_change, names='value')
+        
         # Link namespace dropdown to update PyTorchJob list
         self.namespace_dropdown.observe(self._on_namespace_change, names='value')
         
@@ -178,6 +193,7 @@ class KServeDeployer:
         
         # Link InferenceService dropdown to update status
         self.inferenceservice_dropdown.observe(self._update_service_status, names='value')
+        self.inferenceservice_dropdown.observe(self._on_inferenceservice_selection_change, names='value')
         
         # Create HBox for PyTorchJob dropdown and buttons
         self.pytorchjob_row = widgets.HBox([
@@ -207,6 +223,8 @@ class KServeDeployer:
             self.create_button,
             widgets.HTML('<hr style="margin: 20px 0;"><h3>📊 InferenceService Management</h3>'),
             self.inferenceservice_row,
+            self.watch_service_checkbox,
+            self.watch_status,
             self.service_status_info,
             self.output
         ])
@@ -737,6 +755,204 @@ class KServeDeployer:
         self.log_status.value = '<i>Log monitoring: Inactive</i>'
         with self.output:
             print("Stopped log monitoring")
+    
+    def _on_watch_service_change(self, change):
+        """Handles InferenceService watch checkbox changes."""
+        if change['new']:  # Start watching
+            self._start_service_watching()
+        else:  # Stop watching
+            self._stop_service_watching()
+    
+    def _start_service_watching(self):
+        """Starts background watching for the selected InferenceService."""
+        if self.service_watch_thread and self.service_watch_thread.is_alive():
+            return  # Already watching
+            
+        selected_service = self.inferenceservice_dropdown.value
+        if not selected_service:
+            with self.output:
+                print("Please select an InferenceService to watch")
+            self.watch_service_checkbox.value = False
+            return
+            
+        # Extract service name (remove status indicator)
+        service_name = selected_service.split(' (')[0]
+        
+        with self.output:
+            print(f"🔍 Starting to watch InferenceService: {service_name}")
+        
+        self.stop_service_watching = False
+        self.service_watch_thread = threading.Thread(
+            target=self._watch_service_worker,
+            args=(service_name,),
+            daemon=True
+        )
+        self.service_watch_thread.start()
+        
+        self.watch_status.value = f'<span style="color: green;">InferenceService watching: Active for {service_name}</span>'
+    
+    def _stop_service_watching(self):
+        """Stops background InferenceService watching."""
+        self.stop_service_watching = True
+        self.watch_status.value = '<i>InferenceService watching: Inactive</i>'
+        with self.output:
+            print("Stopped InferenceService watching")
+    
+    def _on_inferenceservice_selection_change(self, change):
+        """Handles InferenceService dropdown selection changes."""
+        # If watching is currently active and a different service is selected, stop watching
+        if self.watch_service_checkbox.value and self.service_watch_thread and self.service_watch_thread.is_alive():
+            with self.output:
+                print("🔄 InferenceService selection changed, stopping current watch...")
+            self.watch_service_checkbox.value = False  # This will trigger _on_watch_service_change
+    
+    def _watch_service_worker(self, service_name):
+        """Background worker that watches an InferenceService for status changes."""
+        try:
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value
+            api_token = self.kube_token.value
+            namespace = self._get_selected_namespace()
+            
+            if not api_server_url or not api_token:
+                with self.output:
+                    print("❌ Cannot watch service: Kubernetes credentials not provided")
+                self.watch_service_checkbox.value = False
+                return
+            
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            api = client.CustomObjectsApi(api_client)
+            
+            with self.output:
+                print(f"👁️  Starting to watch InferenceService '{service_name}' in namespace '{namespace}'")
+            
+            last_ready_status = None
+            watch_timeout = 600  # 10 minutes timeout
+            
+            while not self.stop_service_watching:
+                try:
+                    # Create a watch stream for the specific InferenceService
+                    w = watch.Watch()
+                    
+                    # Watch for changes to the specific InferenceService
+                    for event in w.stream(
+                        api.list_namespaced_custom_object,
+                        group='serving.kserve.io',
+                        version='v1beta1',
+                        namespace=namespace,
+                        plural='inferenceservices',
+                        field_selector=f"metadata.name={service_name}",
+                        timeout_seconds=watch_timeout
+                    ):
+                        if self.stop_service_watching:
+                            break
+                            
+                        event_type = event['type']
+                        service_obj = event['object']
+                        
+                        if service_obj['metadata']['name'] != service_name:
+                            continue
+                            
+                        # Extract status information
+                        status = service_obj.get('status', {})
+                        conditions = status.get('conditions', [])
+                        
+                        # Find the Ready condition
+                        ready_status = 'Unknown'
+                        ready_reason = ''
+                        ready_message = ''
+                        
+                        for condition in conditions:
+                            if condition.get('type') == 'Ready':
+                                ready_status = condition.get('status', 'Unknown')
+                                ready_reason = condition.get('reason', '')
+                                ready_message = condition.get('message', '')
+                                break
+                        
+                        # Check if status changed
+                        if ready_status != last_ready_status:
+                            timestamp = datetime.now().strftime("%H:%M:%S")
+                            
+                            with self.output:
+                                print(f"🔄 [{timestamp}] InferenceService '{service_name}' status changed:")
+                                print(f"   Ready: {ready_status}")
+                                if ready_reason:
+                                    print(f"   Reason: {ready_reason}")
+                                if ready_message:
+                                    print(f"   Message: {ready_message}")
+                            
+                            # Special handling when service becomes ready
+                            if ready_status == 'True' and last_ready_status != 'True':
+                                with self.output:
+                                    print(f"🎉 [{timestamp}] InferenceService '{service_name}' is now READY!")
+                                    print(f"🔄 Refreshing service information...")
+                                
+                                # Update the service status display
+                                self._update_service_status()
+                                
+                                # Refresh the dropdown to show updated status
+                                self._update_inferenceservice_dropdown()
+                                
+                                # Get the service URL if available
+                                service_url = status.get('url', '')
+                                if service_url:
+                                    with self.output:
+                                        print(f"🌐 Service URL: {service_url}")
+                            
+                            # Update last known status
+                            last_ready_status = ready_status
+                            
+                        # Handle deletion event
+                        if event_type == 'DELETED':
+                            with self.output:
+                                print(f"🗑️  InferenceService '{service_name}' was deleted")
+                            # Refresh the dropdown
+                            self._update_inferenceservice_dropdown()
+                            # Stop watching as the service no longer exists
+                            self.stop_service_watching = True
+                            break
+                    
+                    # If we reach here, the watch stream ended
+                    if not self.stop_service_watching:
+                        with self.output:
+                            print(f"🔄 Watch stream ended for '{service_name}', restarting...")
+                        time.sleep(5)  # Wait before restarting watch
+                    
+                except client.ApiException as e:
+                    if e.status == 404:
+                        with self.output:
+                            print(f"❌ InferenceService '{service_name}' not found")
+                        self.stop_service_watching = True
+                        break
+                    elif e.status == 410:  # Gone - resource version too old
+                        with self.output:
+                            print(f"🔄 Watch expired for '{service_name}', restarting...")
+                        time.sleep(2)
+                        continue
+                    else:
+                        with self.output:
+                            print(f"❌ API error watching '{service_name}': {e.reason}")
+                        time.sleep(10)
+                        continue
+                except Exception as e:
+                    with self.output:
+                        print(f"❌ Error watching '{service_name}': {e}")
+                    time.sleep(10)
+                    continue
+                    
+        except Exception as e:
+            with self.output:
+                print(f"💥 Fatal error in service watching: {e}")
+        finally:
+            if not self.stop_service_watching:
+                self.watch_status.value = '<span style="color: red;">InferenceService watching: Error</span>'
+            with self.output:
+                print(f"👁️  Stopped watching InferenceService '{service_name}'")
     
     def _scan_job_for_checkpoints(self, job_name):
         """Immediately scans a PyTorchJob's complete log history for checkpoints."""
@@ -1376,6 +1592,7 @@ class KServeDeployer:
     def __del__(self):
         """Cleanup when widget is destroyed."""
         self._stop_log_monitoring()
+        self._stop_service_watching()
     
     def _ipython_display_(self):
         """Allows the object to be displayed directly in a notebook."""
