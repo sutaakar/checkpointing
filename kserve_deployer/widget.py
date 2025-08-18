@@ -83,6 +83,12 @@ class KServeDeployer:
             icon='refresh',
             layout=widgets.Layout(width='120px')
         )
+        self.scan_checkpoints_button = widgets.Button(
+            description='Scan for Checkpoints',
+            button_style='warning',
+            icon='search',
+            layout=widgets.Layout(width='160px')
+        )
         self.monitor_logs_checkbox = widgets.Checkbox(
             value=False,
             description='Monitor PyTorchJob logs for new checkpoints',
@@ -112,6 +118,7 @@ class KServeDeployer:
         # Link buttons to their functions
         self.create_button.on_click(self._create_inference_service)
         self.refresh_jobs_button.on_click(self._refresh_jobs_button_click)
+        self.scan_checkpoints_button.on_click(self._scan_checkpoints_button_click)
         
         # Link checkbox to enable/disable log monitoring
         self.monitor_logs_checkbox.observe(self._on_monitor_logs_change, names='value')
@@ -123,10 +130,11 @@ class KServeDeployer:
         self.kube_api_server.observe(self._on_credentials_change, names='value')
         self.kube_token.observe(self._on_credentials_change, names='value')
         
-        # Create HBox for PyTorchJob dropdown and refresh button
+        # Create HBox for PyTorchJob dropdown and buttons
         self.pytorchjob_row = widgets.HBox([
             self.pytorchjob_dropdown,
-            self.refresh_jobs_button
+            self.refresh_jobs_button,
+            self.scan_checkpoints_button
         ])
         
         # The VBox holds all our UI elements
@@ -297,6 +305,22 @@ class KServeDeployer:
         with self.output:
             print("Refreshing PyTorchJob list...")
         self._update_pytorchjob_dropdown()
+    
+    def _scan_checkpoints_button_click(self, button):
+        """Handles scan checkpoints button click."""
+        selected_job = self.pytorchjob_dropdown.value
+        if not selected_job:
+            with self.output:
+                print("⚠️  Please select a PyTorchJob to scan for checkpoints")
+            return
+            
+        # Extract job name (remove status indicator)
+        job_name = selected_job.split(' (')[0]
+        
+        with self.output:
+            print(f"🔍 Manually scanning PyTorchJob '{job_name}' for checkpoints...")
+        
+        self._scan_job_for_checkpoints(job_name)
         
     def _on_monitor_logs_change(self, change):
         """Handles log monitoring checkbox changes."""
@@ -320,6 +344,11 @@ class KServeDeployer:
         # Extract job name (remove status indicator)
         job_name = selected_job.split(' (')[0]
         
+        # First, do an immediate scan for completed jobs to find historical checkpoints
+        with self.output:
+            print(f"🔍 Starting initial checkpoint scan for PyTorchJob: {job_name}")
+        self._scan_job_for_checkpoints(job_name)
+        
         self.stop_monitoring = False
         self.log_monitor_thread = threading.Thread(
             target=self._monitor_logs_worker,
@@ -330,7 +359,7 @@ class KServeDeployer:
         
         self.log_status.value = f'<span style="color: green;">Log monitoring: Active for {job_name}</span>'
         with self.output:
-            print(f"Started monitoring logs for PyTorchJob: {job_name}")
+            print(f"Started continuous monitoring for PyTorchJob: {job_name}")
     
     def _stop_log_monitoring(self):
         """Stops background log monitoring."""
@@ -338,6 +367,149 @@ class KServeDeployer:
         self.log_status.value = '<i>Log monitoring: Inactive</i>'
         with self.output:
             print("Stopped log monitoring")
+    
+    def _scan_job_for_checkpoints(self, job_name):
+        """Immediately scans a PyTorchJob's complete log history for checkpoints."""
+        try:
+            # Get Kubernetes configuration
+            api_server_url = self.kube_api_server.value
+            api_token = self.kube_token.value
+            namespace = self._get_selected_namespace()
+            
+            if not api_server_url or not api_token:
+                with self.output:
+                    print("⚠️  Cannot scan: Kubernetes credentials not provided")
+                return
+            
+            configuration = client.Configuration()
+            configuration.host = api_server_url
+            configuration.api_key['authorization'] = f"Bearer {api_token}"
+            configuration.verify_ssl = False
+            
+            api_client = client.ApiClient(configuration)
+            v1 = client.CoreV1Api(api_client)
+            
+            # Checkpoint detection patterns (same as monitoring worker)
+            checkpoint_patterns = [
+                r'saving.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)',
+                r'saved.*?checkpoint.*?to\s+([/\w\-\./]+/checkpoint-\d+)', 
+                r'checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
+                r'saving.*?model.*?to\s+([/\w\-\./]+)',
+                r'saving model checkpoint to\s+([/\w\-\./]+)',
+                r'model.*?checkpoint.*?saved.*?to\s+([/\w\-\./]+)',
+                r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'saving.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)',
+                r'saved.*?(?:checkpoint|model).*?([/\w\-\./]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)'
+            ]
+            
+            # Find pods associated with the PyTorchJob
+            possible_selectors = [
+                f"job-name={job_name}",
+                f"pytorch-job-name={job_name}",
+                f"training.kubeflow.org/job-name={job_name}",
+                f"pytorch.org/job-name={job_name}",
+                f"app.kubernetes.io/name={job_name}"
+            ]
+            
+            pods_found = []
+            for selector in possible_selectors:
+                pods = v1.list_namespaced_pod(
+                    namespace=namespace,
+                    label_selector=selector
+                )
+                if pods.items:
+                    pods_found = pods.items
+                    with self.output:
+                        print(f"📦 Found {len(pods.items)} pod(s) for job '{job_name}' using selector: {selector}")
+                    break
+            
+            if not pods_found:
+                # Try name pattern matching
+                all_pods = v1.list_namespaced_pod(namespace=namespace)
+                for pod in all_pods.items:
+                    if job_name in pod.metadata.name:
+                        pods_found.append(pod)
+                
+                if pods_found:
+                    with self.output:
+                        print(f"📦 Found {len(pods_found)} pod(s) for job '{job_name}' by name pattern")
+            
+            if not pods_found:
+                with self.output:
+                    print(f"❌ No pods found for PyTorchJob '{job_name}'")
+                return
+            
+            checkpoints_found_this_scan = set()
+            
+            for pod in pods_found:
+                pod_name = pod.metadata.name
+                
+                try:
+                    with self.output:
+                        print(f"📋 Scanning complete log history of pod '{pod_name}'...")
+                    
+                    # Get all logs for this pod
+                    logs = v1.read_namespaced_pod_log(
+                        name=pod_name,
+                        namespace=namespace,
+                        timestamps=True
+                    )
+                    
+                    lines_scanned = 0
+                    for line in logs.split('\n'):
+                        lines_scanned += 1
+                        line = line.strip()
+                        if not line:
+                            continue
+                            
+                        for i, pattern in enumerate(checkpoint_patterns):
+                            match = re.search(pattern, line, re.IGNORECASE)
+                            if match:
+                                checkpoint_path = match.group(1)
+                                timestamp = datetime.now().strftime("%H:%M:%S")
+                                
+                                # Add to detected checkpoints if new
+                                if checkpoint_path not in self.detected_checkpoints:
+                                    self.detected_checkpoints.add(checkpoint_path)
+                                    checkpoints_found_this_scan.add(checkpoint_path)
+                                    self.last_checkpoint_time[checkpoint_path] = timestamp
+                                    
+                                    with self.output:
+                                        print(f"✅ Found checkpoint in log: {checkpoint_path}")
+                                else:
+                                    checkpoints_found_this_scan.add(checkpoint_path)
+                                break
+                    
+                    with self.output:
+                        print(f"📊 Scanned {lines_scanned} log lines from pod '{pod_name}'")
+                        
+                except client.ApiException as e:
+                    with self.output:
+                        if e.status == 404:
+                            print(f"⚠️  Pod '{pod_name}' logs not found (pod may be too old)")
+                        else:
+                            print(f"❌ Error accessing logs for pod '{pod_name}': {e}")
+                except Exception as e:
+                    with self.output:
+                        print(f"❌ Error scanning pod '{pod_name}': {e}")
+            
+            # Update UI with results
+            if checkpoints_found_this_scan:
+                with self.output:
+                    print(f"🎉 Initial scan complete: Found {len(checkpoints_found_this_scan)} checkpoint(s)")
+                    for cp in sorted(checkpoints_found_this_scan):
+                        print(f"  📁 {cp}")
+                self.update_checkpoints_dropdown()
+            else:
+                with self.output:
+                    print("📭 No checkpoints found in job logs")
+                    
+        except Exception as e:
+            with self.output:
+                print(f"💥 Error during checkpoint scan: {e}")
     
     def _monitor_logs_worker(self, job_name):
         """Background worker that monitors PyTorchJob logs for checkpoint events."""
@@ -437,11 +609,12 @@ class KServeDeployer:
                         pod_name = pod.metadata.name
                         
                         try:
-                            # Get recent logs
+                            # For the monitoring worker, only check recent logs since we do initial scan on start
+                            # This prevents repeated scanning of completed jobs
                             logs = v1.read_namespaced_pod_log(
                                 name=pod_name,
                                 namespace=namespace,
-                                since_seconds=60,  # Increased to 60 seconds to catch more logs
+                                since_seconds=60,  # Last 60 seconds
                                 timestamps=True
                             )
                             
