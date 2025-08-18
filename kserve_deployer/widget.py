@@ -7,22 +7,31 @@ from datetime import datetime
 from kubernetes import client, config, watch
 
 class KServeDeployer:
-    """A ready-to-use Jupyter widget for deploying KServe InferenceServices.
+    """A ready-to-use Jupyter widget for deploying Serverless KServe InferenceServices with vLLM.
     
-    This widget automatically detects checkpoints from PyTorchJob logs and deploys them
-    as KServe InferenceServices. It's designed for Kubernetes environments where training
-    and notebook pods typically have different filesystem access.
+    This widget automatically detects checkpoint folders from PyTorchJob logs and deploys them
+    as Serverless KServe InferenceServices optimized for Large Language Model inference using vLLM runtime.
+    It uses OpenShift Knative Serving with Istio service mesh for advanced traffic management and scaling.
+    
+    Features:
+    - Automatic checkpoint folder detection from PyTorchJob logs
+    - PVC auto-detection from PyTorchJob specifications  
+    - vLLM-optimized Serverless InferenceService specs with GPU resources
+    - OpenShift Knative integration with passthrough traffic routing
+    - Istio service mesh with sidecar injection and HTTP prober rewriting
+    - Real-time storage URI preview
+    - Support for both running and completed PyTorchJobs
     
     Args:
         path_mapping (dict): Optional mapping of training paths to deployment paths, e.g.
             {'/opt/model-dir': 'pvc://shared-storage', '/training': 'pvc://models'}
     
     Examples:
-        # Basic usage - detects checkpoints from PyTorchJob logs
+        # Basic usage - detects checkpoint folders from PyTorchJob logs
         KServeDeployer()
         
         # With path mapping for different storage URIs
-        KServeDeployer(path_mapping={'/opt/model-dir': 'pvc://shared-storage'})
+        KServeDeployer(path_mapping={'/mnt/shared': 'pvc://shared-storage'})
     """
     
     def __init__(self, path_mapping=None):
@@ -101,12 +110,18 @@ class KServeDeployer:
         )
         self.checkpoints_dropdown = widgets.Dropdown(
             options=[],
-            description='Checkpoints:',
+            description='Checkpoint Folders:',
+            style={'description_width': 'initial'}
         )
         self.inference_service_name = widgets.Text(
             value='my-inference-service',
             placeholder='Enter a name for the InferenceService',
             description='Service Name:',
+            style={'description_width': 'initial'}
+        )
+        self.storage_uri_info = widgets.HTML(
+            value='<i>Storage URI will be shown here once checkpoint is selected</i>',
+            style={'description_width': 'initial'}
         )
         self.create_button = widgets.Button(
             description='Create InferenceService',
@@ -130,6 +145,10 @@ class KServeDeployer:
         self.kube_api_server.observe(self._on_credentials_change, names='value')
         self.kube_token.observe(self._on_credentials_change, names='value')
         
+        # Link dropdowns to update storage URI preview
+        self.checkpoints_dropdown.observe(self._update_storage_uri_preview, names='value')
+        self.pytorchjob_dropdown.observe(self._update_storage_uri_preview, names='value')
+        
         # Create HBox for PyTorchJob dropdown and buttons
         self.pytorchjob_row = widgets.HBox([
             self.pytorchjob_dropdown,
@@ -146,7 +165,8 @@ class KServeDeployer:
             self.monitor_logs_checkbox,
             self.log_status,
             self.checkpoints_dropdown, 
-            self.inference_service_name, 
+            self.inference_service_name,
+            self.storage_uri_info,
             self.create_button, 
             self.output
         ])
@@ -224,6 +244,9 @@ class KServeDeployer:
                     
                 if self.path_mapping:
                     print(f"\n📍 Applied path mapping: {self.path_mapping}")
+                
+                # Update storage URI preview
+                self._update_storage_uri_preview()
                 
     def _update_namespace_dropdown(self):
         """Updates the namespace dropdown with common namespaces."""
@@ -349,6 +372,60 @@ class KServeDeployer:
             print(f"🔍 Manually scanning PyTorchJob '{job_name}' for checkpoint folders...")
         
         self._scan_job_for_checkpoints(job_name)
+    
+    def _update_storage_uri_preview(self, change=None):
+        """Updates the storage URI preview based on current selections."""
+        try:
+            checkpoint_path = self.checkpoints_dropdown.value
+            selected_job = self.pytorchjob_dropdown.value
+            
+            if not checkpoint_path or not selected_job:
+                self.storage_uri_info.value = '<i>Select PyTorchJob and checkpoint to see storage URI preview</i>'
+                return
+            
+            # For preview, try to get actual mount path from PyTorchJob spec if credentials available
+            job_name = selected_job.split(' (')[0] if selected_job else None
+            api_client = None
+            
+            # Try to get API client if credentials are provided
+            api_server_url = self.kube_api_server.value.strip()
+            api_token = self.kube_token.value.strip()
+            
+            if api_server_url and api_token and job_name:
+                try:
+                    configuration = client.Configuration()
+                    configuration.host = api_server_url
+                    configuration.api_key['authorization'] = f"Bearer {api_token}"
+                    configuration.verify_ssl = False
+                    api_client = client.ApiClient(configuration)
+                except Exception:
+                    pass  # Fall back to static method
+            
+            relative_path = self._extract_relative_path_for_pvc(checkpoint_path, job_name, api_client)
+            
+            if relative_path:
+                # Show successful storage URI format
+                storage_uri_preview = f'pvc://&lt;pvc-name&gt;/{relative_path}'
+                
+                self.storage_uri_info.value = f'''
+                <div style="background-color: #f0f8ff; padding: 8px; border-left: 4px solid #0066cc; margin: 4px 0;">
+                    <strong>📦 Storage URI Preview:</strong><br/>
+                    <code style="background-color: #e6f3ff; padding: 2px 4px; border-radius: 3px;">{storage_uri_preview}</code><br/>
+                    <small><i>✅ Path extracted from PyTorchJob specification</i></small>
+                </div>
+                '''
+            else:
+                # Show error when path extraction fails
+                self.storage_uri_info.value = f'''
+                <div style="background-color: #fff3f3; padding: 8px; border-left: 4px solid #cc0000; margin: 4px 0;">
+                    <strong>❌ Storage URI Error:</strong><br/>
+                    <small><i>Cannot extract relative path from PyTorchJob specification.<br/>
+                    Check that PyTorchJob has proper PVC volume mounts configured.</i></small>
+                </div>
+                '''
+            
+        except Exception as e:
+            self.storage_uri_info.value = f'<i>Error generating preview: {e}</i>'
         
     def _on_monitor_logs_change(self, change):
         """Handles log monitoring checkbox changes."""
@@ -764,16 +841,82 @@ class KServeDeployer:
             api_client = client.ApiClient(configuration)
             api = client.CustomObjectsApi(api_client)
 
+            # Get PVC name from the selected PyTorchJob
+            selected_job = self.pytorchjob_dropdown.value
+            if not selected_job:
+                with self.output:
+                    self.output.clear_output()
+                    print("Error: Please select a PyTorchJob to get PVC information.")
+                return
+                
+            job_name = selected_job.split(' (')[0]
+            pvc_name = self._get_pytorchjob_pvc_name(job_name, api_client)
+            
+            if not pvc_name:
+                with self.output:
+                    self.output.clear_output()
+                    print("❌ Error: Could not determine PVC name from PyTorchJob.")
+                    print("   InferenceService creation requires proper PVC configuration in PyTorchJob.")
+                return
+            
+            # Extract relative path from checkpoint_path for the PVC using PyTorchJob spec
+            relative_path = self._extract_relative_path_for_pvc(checkpoint_path, job_name, api_client)
+            
+            if not relative_path:
+                with self.output:
+                    self.output.clear_output()
+                    print("❌ Error: Could not extract relative path from checkpoint using PyTorchJob specification.")
+                    print("   This usually indicates:")
+                    print("   • Checkpoint path doesn't match PyTorchJob PVC mount path")
+                    print("   • PyTorchJob doesn't have proper PVC volume mounts configured")
+                    print("   • Training job and inference deployment have mismatched storage configuration")
+                return
+                
+            storage_uri = f'pvc://{pvc_name}/{relative_path}'
+            
+            with self.output:
+                print(f"📦 Using PVC: {pvc_name}")
+                print(f"📁 Checkpoint relative path: {relative_path}")
+                print(f"🔗 Final storage URI: {storage_uri}")
+
             # --- InferenceService Definition ---
             inference_service = {
                 'apiVersion': 'serving.kserve.io/v1beta1',
                 'kind': 'InferenceService',
-                'metadata': {'name': service_name, 'annotations': {'serving.kserve.io/deploymentMode': 'ModelMesh'}},
+                'metadata': {
+                    'name': service_name,
+                    'annotations': {
+                        'serving.knative.openshift.io/enablePassthrough': 'true',
+                        'serving.kserve.io/deploymentMode': 'Serverless',
+                        'serving.kserve.io/stop': 'false',
+                        'sidecar.istio.io/inject': 'true',
+                        'sidecar.istio.io/rewriteAppHTTPProbers': 'true'
+                    }
+                },
                 'spec': {
                     'predictor': {
+                        'automountServiceAccountToken': False,
+                        'maxReplicas': 1,
+                        'minReplicas': 1,
                         'model': {
-                            'modelFormat': {'name': 'pytorch'},
-                            'storageUri': f'pvc://{checkpoint_path}'
+                            'modelFormat': {
+                                'name': 'vLLM'
+                            },
+                            'name': '',
+                            'resources': {
+                                'limits': {
+                                    'cpu': '10',
+                                    'memory': '20Gi',
+                                    'nvidia.com/gpu': '1'
+                                },
+                                'requests': {
+                                    'cpu': '6',
+                                    'memory': '16Gi',
+                                    'nvidia.com/gpu': '1'
+                                }
+                            },
+                            'runtime': 'example',
+                            'storageUri': storage_uri
                         }
                     }
                 }
@@ -789,9 +932,14 @@ class KServeDeployer:
 
             with self.output:
                 self.output.clear_output()
-                print(f"InferenceService '{service_name}' created successfully!")
-                print(f"Using checkpoint from: {checkpoint_path}")
-                print(f"Deployed to namespace: {namespace}")
+                print(f"✅ InferenceService '{service_name}' created successfully!")
+                print(f"🎯 Model Format: vLLM")
+                print(f"📦 Storage URI: {storage_uri}")
+                print(f"💾 Resources: 6-10 CPU, 16-20Gi Memory, 1 GPU")
+                print(f"🚀 Deployment Mode: Serverless (with OpenShift Knative)")
+                print(f"🔗 Istio Sidecar: Enabled with HTTP prober rewriting")
+                print(f"🌐 Passthrough: Enabled for direct traffic routing")
+                print(f"🏠 Deployed to namespace: {namespace}")
 
         except client.ApiException as e:
             with self.output:
@@ -801,6 +949,160 @@ class KServeDeployer:
             with self.output:
                 self.output.clear_output()
                 print(f"An unexpected error occurred: {e}")
+    
+    def _get_pytorchjob_pvc_name(self, job_name, api_client):
+        """Extracts PVC name from PyTorchJob specification."""
+        try:
+            api = client.CustomObjectsApi(api_client)
+            namespace = self._get_selected_namespace()
+            
+            # Get the PyTorchJob
+            pytorchjob = api.get_namespaced_custom_object(
+                group='kubeflow.org',
+                version='v1',
+                namespace=namespace,
+                plural='pytorchjobs',
+                name=job_name
+            )
+            
+            # Look for PVC references in the job spec
+            spec = pytorchjob.get('spec', {})
+            
+            # Check different worker types (master, worker)
+            for worker_type in ['pytorchReplicaSpecs', 'replicaSpecs']:
+                replica_specs = spec.get(worker_type, {})
+                
+                for replica_type, replica_spec in replica_specs.items():
+                    template = replica_spec.get('template', {})
+                    pod_spec = template.get('spec', {})
+                    volumes = pod_spec.get('volumes', [])
+                    
+                    # Look for PVC volumes
+                    for volume in volumes:
+                        pvc_claim = volume.get('persistentVolumeClaim', {})
+                        if pvc_claim:
+                            pvc_name = pvc_claim.get('claimName')
+                            if pvc_name:
+                                with self.output:
+                                    print(f"🔍 Found PVC '{pvc_name}' in PyTorchJob '{job_name}'")
+                                return pvc_name
+            
+            with self.output:
+                print(f"⚠️  No PVC found in PyTorchJob '{job_name}' specification")
+            return None
+            
+        except client.ApiException as e:
+            with self.output:
+                print(f"❌ Error getting PyTorchJob '{job_name}': {e}")
+            return None
+        except Exception as e:
+            with self.output:
+                print(f"❌ Error extracting PVC from PyTorchJob: {e}")
+            return None
+    
+    def _get_pvc_mount_path_from_job(self, job_name, api_client):
+        """Extracts PVC mount path from PyTorchJob specification."""
+        try:
+            api = client.CustomObjectsApi(api_client)
+            namespace = self._get_selected_namespace()
+            
+            # Get the PyTorchJob
+            pytorchjob = api.get_namespaced_custom_object(
+                group='kubeflow.org',
+                version='v1',
+                namespace=namespace,
+                plural='pytorchjobs',
+                name=job_name
+            )
+            
+            # Look for volume mounts in the job spec
+            spec = pytorchjob.get('spec', {})
+            
+            # Check different worker types (master, worker)
+            for worker_type in ['pytorchReplicaSpecs', 'replicaSpecs']:
+                replica_specs = spec.get(worker_type, {})
+                
+                for replica_type, replica_spec in replica_specs.items():
+                    template = replica_spec.get('template', {})
+                    pod_spec = template.get('spec', {})
+                    
+                    # Get volumes and their PVC names
+                    volumes = pod_spec.get('volumes', [])
+                    pvc_volume_mapping = {}
+                    
+                    for volume in volumes:
+                        pvc_claim = volume.get('persistentVolumeClaim', {})
+                        if pvc_claim:
+                            volume_name = volume.get('name')
+                            pvc_name = pvc_claim.get('claimName')
+                            if volume_name and pvc_name:
+                                pvc_volume_mapping[volume_name] = pvc_name
+                    
+                    # Get containers and their volume mounts
+                    containers = pod_spec.get('containers', [])
+                    for container in containers:
+                        volume_mounts = container.get('volumeMounts', [])
+                        
+                        for volume_mount in volume_mounts:
+                            volume_name = volume_mount.get('name')
+                            mount_path = volume_mount.get('mountPath')
+                            
+                            if volume_name in pvc_volume_mapping and mount_path:
+                                with self.output:
+                                    print(f"🔍 Found PVC mount: {pvc_volume_mapping[volume_name]} → {mount_path}")
+                                return mount_path
+            
+            with self.output:
+                print(f"⚠️  No PVC mount path found in PyTorchJob '{job_name}' specification")
+            return None
+            
+        except client.ApiException as e:
+            with self.output:
+                print(f"❌ Error getting PyTorchJob mount path '{job_name}': {e}")
+            return None
+        except Exception as e:
+            with self.output:
+                print(f"❌ Error extracting mount path from PyTorchJob: {e}")
+            return None
+    
+    def _extract_relative_path_for_pvc(self, checkpoint_path, job_name=None, api_client=None):
+        """Extracts the relative path within PVC from absolute checkpoint path using PyTorchJob spec."""
+        
+        # Require PyTorchJob info for accurate path extraction
+        if not job_name or not api_client:
+            with self.output:
+                print(f"❌ Cannot extract relative path: PyTorchJob name or API client not available")
+            return None
+            
+        # Get mount path from PyTorchJob spec
+        pvc_mount_path = self._get_pvc_mount_path_from_job(job_name, api_client)
+        
+        if not pvc_mount_path:
+            with self.output:
+                print(f"❌ Cannot extract relative path: No PVC mount path found in PyTorchJob '{job_name}'")
+            return None
+            
+        if not checkpoint_path.startswith(pvc_mount_path):
+            with self.output:
+                print(f"❌ Checkpoint path '{checkpoint_path}' does not start with PyTorchJob mount path '{pvc_mount_path}'")
+                print(f"   This indicates a mismatch between training and deployment configurations")
+            return None
+            
+        # Extract relative path using PyTorchJob mount path
+        relative_path = checkpoint_path[len(pvc_mount_path):]
+        # Remove leading slash if present
+        if relative_path.startswith('/'):
+            relative_path = relative_path[1:]
+            
+        if not relative_path:
+            with self.output:
+                print(f"❌ Extracted relative path is empty - checkpoint path equals mount path")
+            return None
+            
+        with self.output:
+            print(f"✅ Extracted relative path: '{relative_path}' from mount '{pvc_mount_path}'")
+            
+        return relative_path
     
     def __del__(self):
         """Cleanup when widget is destroyed."""
