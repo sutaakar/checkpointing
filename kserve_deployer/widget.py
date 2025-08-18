@@ -1,6 +1,5 @@
 import ipywidgets as widgets
 from IPython.display import display
-import os
 import threading
 import time
 import re
@@ -8,23 +7,42 @@ from datetime import datetime
 from kubernetes import client, config, watch
 
 class KServeDeployer:
-    """A ready-to-use Jupyter widget for deploying KServe InferenceServices."""
+    """A ready-to-use Jupyter widget for deploying KServe InferenceServices.
     
-    def __init__(self, checkpoint_dir='/opt/app-root/src/shared'):
-        self.checkpoint_dir = checkpoint_dir
+    This widget automatically detects checkpoints from PyTorchJob logs and deploys them
+    as KServe InferenceServices. It's designed for Kubernetes environments where training
+    and notebook pods typically have different filesystem access.
+    
+    Args:
+        path_mapping (dict): Optional mapping of training paths to deployment paths, e.g.
+            {'/opt/model-dir': 'pvc://shared-storage', '/training': 'pvc://models'}
+    
+    Examples:
+        # Basic usage - detects checkpoints from PyTorchJob logs
+        KServeDeployer()
+        
+        # With path mapping for different storage URIs
+        KServeDeployer(path_mapping={'/opt/model-dir': 'pvc://shared-storage'})
+    """
+    
+    def __init__(self, path_mapping=None):
+        self.path_mapping = path_mapping or {}  # Map training paths to deployment paths
         self.current_namespace = self._detect_current_namespace()
         self.log_monitor_thread = None
         self.stop_monitoring = False
         self.last_checkpoint_time = {}
+        self.detected_checkpoints = set()  # Checkpoints found from logs
         self._build_ui()
         self.update_checkpoints_dropdown()
         self._update_namespace_dropdown()
         self._update_pytorchjob_dropdown()
         
     def _detect_current_namespace(self):
-        """Detects the current namespace from the service account token file."""
+        """Detects the current namespace from environment variables."""
+        import os
+        
+        # Try to read the namespace from the service account token
         try:
-            # Try to read the namespace from the service account token
             namespace_file = '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
             if os.path.exists(namespace_file):
                 with open(namespace_file, 'r') as f:
@@ -125,28 +143,51 @@ class KServeDeployer:
             self.output
         ])
 
+    def _map_checkpoint_path(self, training_path):
+        """Maps a training checkpoint path to deployment path."""
+        # Apply user-defined path mapping
+        for training_prefix, deployment_prefix in self.path_mapping.items():
+            if training_path.startswith(training_prefix):
+                return training_path.replace(training_prefix, deployment_prefix, 1)
+        
+        # Default: use original path (assume it's accessible to InferenceService)
+        return training_path
+    
     def find_checkpoints(self):
-        """Finds directories containing checkpoint files."""
-        path = self.checkpoint_dir
-        if not os.path.isdir(path):
+        """Returns checkpoints detected from PyTorchJob logs."""
+        if not self.detected_checkpoints:
             return []
-        checkpoint_dirs = set()
-        for root, dirs, files in os.walk(path):
-            for file in files:
-                if file.endswith(('.ckpt', '.pt', '.pth', '.bin')):
-                    checkpoint_dirs.add(root)
-                    break
-        return sorted(list(checkpoint_dirs))
+            
+        # Map all detected checkpoints to deployment paths
+        mapped_checkpoints = []
+        for original_path in self.detected_checkpoints:
+            mapped_path = self._map_checkpoint_path(original_path)
+            mapped_checkpoints.append(mapped_path)
+            
+        return sorted(mapped_checkpoints)
 
     def update_checkpoints_dropdown(self):
-        """Populates the dropdown with found checkpoints."""
+        """Populates the dropdown with checkpoints detected from PyTorchJob logs."""
         checkpoints = self.find_checkpoints()
-        self.checkpoints_dropdown.options = checkpoints
+        
         if not checkpoints:
             self.checkpoints_dropdown.disabled = True
             self.create_button.disabled = True
+            self.checkpoints_dropdown.options = []
             with self.output:
-                print(f"No checkpoints found in {self.checkpoint_dir}.")
+                print("No checkpoints detected yet.")
+                print("💡 Start PyTorchJob log monitoring to automatically detect checkpoints.")
+        else:
+            self.checkpoints_dropdown.disabled = False
+            self.create_button.disabled = False
+            self.checkpoints_dropdown.options = checkpoints
+            with self.output:
+                print(f"✅ Found {len(checkpoints)} checkpoint(s) from PyTorchJob logs:")
+                for cp in checkpoints:
+                    print(f"  - {cp}")
+                    
+                if self.path_mapping:
+                    print(f"\n📍 Applied path mapping: {self.path_mapping}")
                 
     def _update_namespace_dropdown(self):
         """Updates the namespace dropdown with common namespaces."""
@@ -314,13 +355,21 @@ class KServeDeployer:
             api_client = client.ApiClient(configuration)
             v1 = client.CoreV1Api(api_client)
             
-            # Checkpoint detection patterns
+            # Checkpoint detection patterns - handle both files and directories
             checkpoint_patterns = [
-                r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin))',
-                r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin))',
-                r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin))',
-                r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin))',
-                r'saving.*?model.*?(\S+\.(?:ckpt|pt|pth|bin))'
+                # Directory patterns (common in transformers/pytorch lightning)
+                r'saving.*?checkpoint.*?to\s+([/\w\-\.]+/checkpoint-\d+)',
+                r'saved.*?checkpoint.*?to\s+([/\w\-\.]+/checkpoint-\d+)', 
+                r'checkpoint.*?saved.*?to\s+([/\w\-\.]+)',
+                r'saving.*?model.*?to\s+([/\w\-\.]+)',
+                # File patterns (traditional checkpoints)
+                r'saved checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'saving.*?checkpoint.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'checkpoint.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                r'model.*?saved.*?(\S+\.(?:ckpt|pt|pth|bin|safetensors))',
+                # Generic patterns
+                r'saving.*?(?:checkpoint|model).*?([/\w\-\.]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)',
+                r'saved.*?(?:checkpoint|model).*?([/\w\-\.]+/(?:checkpoint|ckpt|step|epoch)[-_]\d+)'
             ]
             
             # Get pods associated with the PyTorchJob
@@ -359,12 +408,19 @@ class KServeDeployer:
                                         checkpoint_path = match.group(1)
                                         timestamp = datetime.now().strftime("%H:%M:%S")
                                         
-                                        # Update UI
-                                        with self.output:
-                                            print(f"[{timestamp}] New checkpoint detected: {checkpoint_path}")
-                                        
-                                        # Refresh checkpoints dropdown
-                                        self.update_checkpoints_dropdown()
+                                        # Avoid duplicate notifications for the same checkpoint
+                                        if checkpoint_path not in self.last_checkpoint_time:
+                                            self.last_checkpoint_time[checkpoint_path] = timestamp
+                                            
+                                            # Add to detected checkpoints for prioritized listing
+                                            self.detected_checkpoints.add(checkpoint_path)
+                                            
+                                            # Update UI
+                                            with self.output:
+                                                print(f"[{timestamp}] New checkpoint detected: {checkpoint_path}")
+                                            
+                                            # Refresh checkpoints dropdown
+                                            self.update_checkpoints_dropdown()
                                         break
                                         
                         except client.ApiException:
