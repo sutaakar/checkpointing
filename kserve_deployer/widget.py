@@ -703,19 +703,24 @@ class KServeDeployer:
             conditions = status.get('conditions', [])
             url = status.get('url', 'Not available')
             
+            # Find and display only the Ready condition
+            ready_condition = None
+            for condition in conditions:
+                if condition.get('type') == 'Ready':
+                    ready_condition = condition
+                    break
+            
             # Build status display
             status_html = f'''
             <div style="background-color: #f8f9fa; padding: 12px; border-radius: 6px; margin: 4px 0;">
                 <strong>📊 Status for {service_name}:</strong><br/>
                 <strong>🔗 URL:</strong> <code>{url}</code><br/>
-                <strong>📋 Conditions:</strong><br/>
             '''
             
-            for condition in conditions:
-                condition_type = condition.get('type', 'Unknown')
-                condition_status = condition.get('status', 'Unknown')
-                reason = condition.get('reason', '')
-                message = condition.get('message', '')
+            if ready_condition:
+                condition_status = ready_condition.get('status', 'Unknown')
+                reason = ready_condition.get('reason', '')
+                message = ready_condition.get('message', '')
                 
                 if condition_status == 'True':
                     icon = '✅'
@@ -728,8 +733,9 @@ class KServeDeployer:
                     color = 'orange'
                 
                 status_html += f'''
+                <strong>📋 Ready Status:</strong><br/>
                 <div style="margin-left: 15px; color: {color};">
-                    {icon} <strong>{condition_type}:</strong> {condition_status}
+                    {icon} <strong>Ready:</strong> {condition_status}
                 '''
                 
                 if reason:
@@ -738,6 +744,13 @@ class KServeDeployer:
                     status_html += f'<br/>&nbsp;&nbsp;&nbsp;&nbsp;<small><i>{message}</i></small>'
                     
                 status_html += '</div>'
+            else:
+                status_html += '''
+                <strong>📋 Ready Status:</strong><br/>
+                <div style="margin-left: 15px; color: orange;">
+                    ⚠️ <strong>Ready condition not found</strong>
+                </div>
+                '''
             
             status_html += '</div>'
             self.service_status_info.value = status_html
