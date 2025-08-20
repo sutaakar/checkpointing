@@ -19,7 +19,7 @@ class KServeDeployer:
     - vLLM-optimized Serverless InferenceService specs with GPU resources
     - OpenShift Knative integration with passthrough traffic routing
     - Istio service mesh with sidecar injection and HTTP prober rewriting
-    - Real-time storage URI preview
+
     - Support for both running and completed PyTorchJobs
     
     Args:
@@ -122,10 +122,7 @@ class KServeDeployer:
             description='Service Name:',
             style={'description_width': 'initial'}
         )
-        self.storage_uri_info = widgets.HTML(
-            value='<i>Storage URI will be shown here once checkpoint is selected</i>',
-            style={'description_width': 'initial'}
-        )
+
         
         # InferenceService management section
         self.inferenceservice_dropdown = widgets.Dropdown(
@@ -187,10 +184,8 @@ class KServeDeployer:
         self.kube_api_server.observe(self._on_credentials_change, names='value')
         self.kube_token.observe(self._on_credentials_change, names='value')
         
-        # Link dropdowns to update storage URI preview and service name
-        self.checkpoints_dropdown.observe(self._update_storage_uri_preview, names='value')
+        # Link dropdown to update service name
         self.checkpoints_dropdown.observe(self._update_service_name_from_checkpoint, names='value')
-        self.pytorchjob_dropdown.observe(self._update_storage_uri_preview, names='value')
         
         # Link InferenceService dropdown to update status
         self.inferenceservice_dropdown.observe(self._update_service_status, names='value')
@@ -220,7 +215,6 @@ class KServeDeployer:
             self.log_status,
             self.checkpoints_dropdown, 
             self.inference_service_name,
-            self.storage_uri_info,
             self.create_button,
             widgets.HTML('<hr style="margin: 20px 0;"><h3>📊 InferenceService Management</h3>'),
             self.inferenceservice_row,
@@ -347,8 +341,7 @@ class KServeDeployer:
                 if self.path_mapping:
                     print(f"\n📍 Applied path mapping: {self.path_mapping}")
                 
-                # Update storage URI preview and service name
-                self._update_storage_uri_preview()
+                # Update service name
                 self._update_service_name_from_checkpoint()
                 
     def _update_namespace_dropdown(self):
@@ -568,60 +561,7 @@ class KServeDeployer:
             with self.output:
                 print(f"❌ Error generating service name: {e}")
     
-    def _update_storage_uri_preview(self, change=None):
-        """Updates the storage URI preview based on current selections."""
-        try:
-            checkpoint_path = self.checkpoints_dropdown.value
-            selected_job = self.pytorchjob_dropdown.value
-            
-            if not checkpoint_path or not selected_job:
-                self.storage_uri_info.value = '<i>Select PyTorchJob and checkpoint to see storage URI preview</i>'
-                return
-            
-            # For preview, try to get actual mount path from PyTorchJob spec if credentials available
-            job_name = selected_job.split(' (')[0] if selected_job else None
-            api_client = None
-            
-            # Try to get API client if credentials are provided
-            api_server_url = self.kube_api_server.value.strip()
-            api_token = self.kube_token.value.strip()
-            
-            if api_server_url and api_token and job_name:
-                try:
-                    configuration = client.Configuration()
-                    configuration.host = api_server_url
-                    configuration.api_key['authorization'] = f"Bearer {api_token}"
-                    configuration.verify_ssl = False
-                    api_client = client.ApiClient(configuration)
-                except Exception:
-                    pass  # Fall back to static method
-            
-            relative_path = self._extract_relative_path_for_pvc(checkpoint_path, job_name, api_client)
-            
-            if relative_path:
-                # Show successful storage URI format
-                storage_uri_preview = f'pvc://&lt;pvc-name&gt;/{relative_path}'
-                
-                self.storage_uri_info.value = f'''
-                <div style="background-color: #f0f8ff; padding: 8px; border-left: 4px solid #0066cc; margin: 4px 0;">
-                    <strong>📦 Storage URI Preview:</strong><br/>
-                    <code style="background-color: #e6f3ff; padding: 2px 4px; border-radius: 3px;">{storage_uri_preview}</code><br/>
-                    <small><i>✅ Path extracted from PyTorchJob specification</i></small>
-                </div>
-                '''
-            else:
-                # Show error when path extraction fails
-                self.storage_uri_info.value = f'''
-                <div style="background-color: #fff3f3; padding: 8px; border-left: 4px solid #cc0000; margin: 4px 0;">
-                    <strong>❌ Storage URI Error:</strong><br/>
-                    <small><i>Cannot extract relative path from PyTorchJob specification.<br/>
-                    Check that PyTorchJob has proper PVC volume mounts configured.</i></small>
-                </div>
-                '''
-            
-        except Exception as e:
-            self.storage_uri_info.value = f'<i>Error generating preview: {e}</i>'
-    
+
     def _update_inferenceservice_dropdown(self, preserve_selection=True):
         """Updates the InferenceService dropdown with available services in the selected namespace."""
         try:
