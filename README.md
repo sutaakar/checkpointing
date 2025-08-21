@@ -56,3 +56,35 @@ To run this example, you need:
 - Kueue installed for job queueing and scheduling.
 - A Persistent Volume Claim (PVC) named `shared` available in the same namespace.
 - A Kubernetes secret named `hf-token` containing a Hugging Face token with access to the required models.
+
+## Kueue Preemption
+
+Setup common Kueue resources (ResourceFlavor, ClusterQueue, LocalQueue).
+
+### Create WorkloadPriorityClass
+
+Create the following WorkloadPriorityClass resources:
+
+```yaml
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: normal-priority
+description: Normal priority
+value: 10
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: WorkloadPriorityClass
+metadata:
+  name: extra-priority
+description: Extra priority
+value: 20
+```
+
+### Apply Priority Classes to PyTorchJob
+
+Add one of the following annotations to your PyTorchJob:
+
+- For normal priority: `"kueue.x-k8s.io/priority-class": "normal-priority"`
+- For extra priority: `"kueue.x-k8s.io/priority-class": "extra-priority"`
