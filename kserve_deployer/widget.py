@@ -1415,6 +1415,9 @@ class KServeDeployer:
                         'serving.kserve.io/stop': 'false',
                         'sidecar.istio.io/inject': 'true',
                         'sidecar.istio.io/rewriteAppHTTPProbers': 'true'
+                    },
+                    'labels': {
+                        'opendatahub.io/dashboard': 'true'
                     }
                 },
                 'spec': {
